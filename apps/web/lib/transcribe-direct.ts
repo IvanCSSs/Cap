@@ -1,5 +1,5 @@
 /**
- * Direct transcription without workflow queue.
+ * Direct transcription using AssemblyAI with speaker diarization.
  * Bypasses the Vercel workflow system to avoid ArrayBuffer serialization issues.
  */
 
@@ -10,7 +10,6 @@ import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
-import { createClient } from "@deepgram/sdk";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
 import { checkHasAudioTrack, extractAudioFromUrl } from "@/lib/audio-extract";
@@ -21,12 +20,113 @@ import {
 	isMediaServerConfigured,
 } from "@/lib/media-client";
 import { runPromise } from "@/lib/server";
-import { type DeepgramResult, formatToWebVTT } from "@/lib/transcribe-utils";
 
 interface TranscribeDirectPayload {
 	videoId: string;
 	userId: string;
 	aiGenerationEnabled: boolean;
+}
+
+interface AssemblyAIUtterance {
+	speaker: string;
+	text: string;
+	start: number;
+	end: number;
+}
+
+interface AssemblyAIResult {
+	id: string;
+	status: string;
+	text: string;
+	utterances?: AssemblyAIUtterance[];
+	error?: string;
+}
+
+// Convert AssemblyAI result to WebVTT format with speaker labels
+function formatToWebVTT(result: AssemblyAIResult): string {
+	const lines: string[] = ["WEBVTT", ""];
+	
+	if (!result.utterances || result.utterances.length === 0) {
+		// Fallback to plain text if no utterances
+		lines.push("00:00:00.000 --> 00:00:10.000");
+		lines.push(result.text || "");
+		return lines.join("\n");
+	}
+
+	for (const utterance of result.utterances) {
+		const startTime = formatTime(utterance.start);
+		const endTime = formatTime(utterance.end);
+		lines.push(`${startTime} --> ${endTime}`);
+		lines.push(`<v Speaker ${utterance.speaker}>${utterance.text}`);
+		lines.push("");
+	}
+
+	return lines.join("\n");
+}
+
+function formatTime(ms: number): string {
+	const totalSeconds = Math.floor(ms / 1000);
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	const milliseconds = ms % 1000;
+	return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${milliseconds.toString().padStart(3, "0")}`;
+}
+
+async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
+	const apiKey = serverEnv().ASSEMBLYAI_API_KEY;
+	if (!apiKey) {
+		throw new Error("Missing ASSEMBLYAI_API_KEY");
+	}
+
+	const headers = {
+		"authorization": apiKey,
+		"content-type": "application/json",
+	};
+
+	// Submit transcription job with speaker diarization
+	console.log(`[transcribe-direct] Submitting to AssemblyAI...`);
+	const submitResponse = await fetch("https://api.assemblyai.com/v2/transcript", {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			audio_url: audioUrl,
+			speaker_labels: true,  // Enable speaker diarization
+		}),
+	});
+
+	if (!submitResponse.ok) {
+		const error = await submitResponse.text();
+		throw new Error(`AssemblyAI submit failed: ${error}`);
+	}
+
+	const job = await submitResponse.json() as { id: string };
+	console.log(`[transcribe-direct] AssemblyAI job ID: ${job.id}`);
+
+	// Poll for completion
+	let result: AssemblyAIResult;
+	while (true) {
+		await new Promise(resolve => setTimeout(resolve, 3000));
+		
+		const pollResponse = await fetch(`https://api.assemblyai.com/v2/transcript/${job.id}`, {
+			headers: { authorization: apiKey },
+		});
+
+		if (!pollResponse.ok) {
+			throw new Error(`AssemblyAI poll failed: ${pollResponse.status}`);
+		}
+
+		result = await pollResponse.json() as AssemblyAIResult;
+		console.log(`[transcribe-direct] AssemblyAI status: ${result.status}`);
+
+		if (result.status === "completed") {
+			break;
+		} else if (result.status === "error") {
+			throw new Error(`AssemblyAI error: ${result.error}`);
+		}
+	}
+
+	return formatToWebVTT(result);
 }
 
 export async function transcribeVideoDirect(
@@ -37,9 +137,10 @@ export async function transcribeVideoDirect(
 	console.log(`[transcribe-direct] Starting transcription for video ${videoId}`);
 
 	try {
-		// Validate and get video data
-		if (!serverEnv().DEEPGRAM_API_KEY) {
-			throw new Error("Missing DEEPGRAM_API_KEY");
+		// Check for AssemblyAI key (primary) or Deepgram key (fallback)
+		const assemblyKey = serverEnv().ASSEMBLYAI_API_KEY;
+		if (!assemblyKey) {
+			throw new Error("Missing ASSEMBLYAI_API_KEY");
 		}
 
 		const query = await db()
@@ -136,7 +237,7 @@ export async function transcribeVideoDirect(
 			}
 		}
 
-		// Upload temp audio
+		// Upload temp audio to S3 so AssemblyAI can access it
 		const audioKey = `${userId}/${videoId}/audio-temp.mp3`;
 		await bucket
 			.putObject(audioKey, audioBuffer, { contentType: "audio/mpeg" })
@@ -146,34 +247,8 @@ export async function transcribeVideoDirect(
 			.getSignedObjectUrl(audioKey)
 			.pipe(runPromise);
 
-		// Transcribe with Deepgram
-		console.log(`[transcribe-direct] Sending to Deepgram...`);
-		const audioResponse = await fetch(audioSignedUrl);
-		if (!audioResponse.ok) {
-			throw new Error(`Audio URL not accessible: ${audioResponse.status}`);
-		}
-
-		const audioArrayBuffer = await audioResponse.arrayBuffer();
-		const audioBufferForDG = Buffer.from(audioArrayBuffer);
-
-		const deepgram = createClient(serverEnv().DEEPGRAM_API_KEY as string);
-
-		const { result: dgResult, error } = await deepgram.listen.prerecorded.transcribeFile(
-			audioBufferForDG,
-			{
-				model: "nova-3",
-				smart_format: true,
-				detect_language: true,
-				utterances: true,
-				mime_type: "audio/mpeg",
-			},
-		);
-
-		if (error) {
-			throw new Error(`Deepgram transcription failed: ${error.message}`);
-		}
-
-		const transcription = formatToWebVTT(dgResult as unknown as DeepgramResult);
+		// Transcribe with AssemblyAI (includes speaker diarization)
+		const transcription = await transcribeWithAssemblyAI(audioSignedUrl);
 
 		// Save transcription
 		await bucket
@@ -194,10 +269,10 @@ export async function transcribeVideoDirect(
 			console.error(`[transcribe-direct] Failed to cleanup temp audio:`, cleanupError);
 		}
 
-		// Queue AI generation if enabled
-		if (aiGenerationEnabled) {
-			await startAiGeneration(videoId as Video.VideoId, userId);
-		}
+		// Skip AI generation for now (still has workflow queue issues)
+		// if (aiGenerationEnabled) {
+		// 	await startAiGeneration(videoId as Video.VideoId, userId);
+		// }
 
 		console.log(`[transcribe-direct] Transcription completed for video ${videoId}`);
 		return { success: true, message: "Transcription completed successfully" };

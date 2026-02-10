@@ -83,6 +83,7 @@ function createServerEnv() {
 
 			/// AI providers
 			DEEPGRAM_API_KEY: z.string().optional().describe("Audio transcription"),
+			ASSEMBLYAI_API_KEY: z.string().optional().describe("Audio transcription with speaker diarization"),
 			OPENAI_API_KEY: z.string().optional().describe("AI summaries"),
 			GROQ_API_KEY: z.string().optional().describe("AI summaries"),
 			REPLICATE_API_TOKEN: z
