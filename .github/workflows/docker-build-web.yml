@@ -1,6 +1,14 @@
 name: "Docker Build Web"
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/web/**'
+      - 'packages/**'
+      - 'Dockerfile'
+      - '.github/workflows/docker-build-web.yml'
   workflow_dispatch:
     inputs:
       tag:

@@ -3,8 +3,8 @@ import { organizations, s3Buckets, videos } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { start } from "workflow/api";
-import { transcribeVideoWorkflow } from "@/workflows/transcribe";
+// Bypass workflow queue - direct transcription to avoid ArrayBuffer serialization issues
+import { transcribeVideoDirect } from "@/lib/transcribe-direct";
 
 type TranscribeResult = {
 	success: boolean;
@@ -97,23 +97,19 @@ export async function transcribeVideo(
 
 	try {
 		console.log(
-			`[transcribeVideo] Triggering transcription workflow for video ${videoId}`,
+			`[transcribeVideo] Starting direct transcription for video ${videoId}`,
 		);
 
-		await start(transcribeVideoWorkflow, [
-			{
-				videoId,
-				userId,
-				aiGenerationEnabled,
-			},
-		]);
+		// Run transcription directly (bypass workflow queue to avoid ArrayBuffer issues)
+		const result = await transcribeVideoDirect({
+			videoId,
+			userId,
+			aiGenerationEnabled,
+		});
 
-		return {
-			success: true,
-			message: "Transcription workflow started",
-		};
+		return result;
 	} catch (error) {
-		console.error("[transcribeVideo] Failed to trigger workflow:", error);
+		console.error("[transcribeVideo] Failed to transcribe:", error);
 
 		await db()
 			.update(videos)
@@ -122,7 +118,7 @@ export async function transcribeVideo(
 
 		return {
 			success: false,
-			message: "Failed to start transcription workflow",
+			message: "Failed to transcribe video",
 		};
 	}
 }
