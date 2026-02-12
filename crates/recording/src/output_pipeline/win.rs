@@ -97,7 +97,7 @@ use windows::{
 };
 
 pub struct WindowsMuxer {
-    video_tx: SyncSender<Option<(scap_direct3d::Frame, Duration)>>,
+    video_tx: SyncSender<Option<(screen_capture::ScreenFrame, Duration)>>,
     output: Arc<Mutex<ffmpeg::format::context::Output>>,
     audio_encoder: Option<AACEncoder>,
     frame_drops: FrameDropTracker,
@@ -143,7 +143,7 @@ impl Muxer for WindowsMuxer {
             "Windows MP4 muxer encoder channel buffer size"
         );
         let (video_tx, video_rx) =
-            sync_channel::<Option<(scap_direct3d::Frame, Duration)>>(buffer_size);
+            sync_channel::<Option<(screen_capture::ScreenFrame, Duration)>>(buffer_size);
 
         let mut output = ffmpeg::format::output(&output_path)?;
 
@@ -410,8 +410,6 @@ impl Muxer for WindowsMuxer {
                         let mut first_timestamp: Option<Duration> = None;
                         let mut last_timestamp: Option<Duration> = None;
 
-                        use scap_ffmpeg::AsFFmpeg;
-
                         loop {
                             let (ffmpeg_frame, ts) = match video_rx.recv_timeout(frame_interval) {
                                 Ok(Some((frame, timestamp))) => {
@@ -478,7 +476,10 @@ impl Muxer for WindowsMuxer {
             .await
             .map_err(|_| anyhow!("Encoder thread ended unexpectedly"))??;
 
-        output.lock().unwrap().write_header()?;
+        output
+            .lock()
+            .map_err(|_| anyhow!("Output mutex poisoned during header write"))?
+            .write_header()?;
 
         Ok(Self {
             video_tx,
@@ -900,7 +901,16 @@ impl Muxer for WindowsCameraMuxer {
                                 }
                             },
                             |output_sample| {
-                                let mut output = output.lock().unwrap();
+                                let mut output = match output.lock() {
+                                    Ok(o) => o,
+                                    Err(_) => {
+                                        tracing::error!("Camera output mutex poisoned during write");
+                                        return Err(windows::core::Error::new(
+                                            windows::core::HRESULT(-1),
+                                            "Camera output mutex poisoned"
+                                        ));
+                                    }
+                                };
                                 if let Err(e) = muxer.write_sample(&output_sample, &mut output)
                                 {
                                     tracing::error!("Camera WriteSample failed: {e}");
@@ -1026,7 +1036,10 @@ impl Muxer for WindowsCameraMuxer {
             .await
             .map_err(|_| anyhow!("Camera encoder thread ended unexpectedly"))??;
 
-        output.lock().unwrap().write_header()?;
+        output
+            .lock()
+            .map_err(|_| anyhow!("Camera output mutex poisoned during header write"))?
+            .write_header()?;
 
         Ok(Self {
             video_tx,
@@ -1701,6 +1714,11 @@ pub fn upload_mf_buffer_to_texture(
     unsafe {
         let mut texture = None;
         device.CreateTexture2D(&texture_desc, Some(&subresource_data), Some(&mut texture))?;
-        Ok(texture.unwrap())
+        texture.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                "CreateTexture2D succeeded but returned no texture",
+            )
+        })
     }
 }
