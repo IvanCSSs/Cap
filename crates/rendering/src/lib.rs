@@ -979,7 +979,31 @@ impl RenderVideoConstants {
                 .map(|c| XY::new(c.width, c.height)),
         };
 
+        #[cfg(not(target_os = "windows"))]
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+        #[cfg(target_os = "windows")]
+        let instance = {
+            let dx12_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::DX12,
+                ..Default::default()
+            });
+            let has_dx12 = dx12_instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .is_ok();
+            if has_dx12 {
+                tracing::info!("Using DX12 backend for optimal D3D11 interop");
+                dx12_instance
+            } else {
+                tracing::info!("DX12 not available, falling back to all backends");
+                wgpu::Instance::new(&wgpu::InstanceDescriptor::default())
+            }
+        };
 
         let hardware_adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -1461,8 +1485,15 @@ impl ProjectUniforms {
 
         let padding = {
             let padding_factor = project.background.padding / 100.0 * SCREEN_MAX_PADDING;
+            let crop_basis = f64::max(cropped_size.x, cropped_size.y);
+            let base_padding = crop_basis * padding_factor;
 
-            f64::max(output_size.x, output_size.y) * padding_factor
+            let (base_w, base_h) = Self::get_base_size(options, project);
+            let output_scale = f64::min(
+                output_size.x / f64::max(base_w as f64, 1.0),
+                output_size.y / f64::max(base_h as f64, 1.0),
+            );
+            base_padding * output_scale
         };
 
         let is_height_constrained = cropped_aspect <= output_aspect;
