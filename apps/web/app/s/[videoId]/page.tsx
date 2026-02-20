@@ -419,38 +419,6 @@ async function AuthorizedContent({
 		aiGenerationEnabled = await isAiGenerationEnabled(videoOwner);
 	}
 
-	if (video.sharedOrganization?.organizationId) {
-		const organization = await db()
-			.select()
-			.from(organizations)
-			.where(eq(organizations.id, video.sharedOrganization.organizationId))
-			.limit(1);
-
-		if (organization[0]?.allowedEmailDomain) {
-			if (
-				!user?.email ||
-				!user.email.endsWith(`@${organization[0].allowedEmailDomain}`)
-			) {
-				console.log(
-					"[ShareVideoPage] Access denied - domain restriction:",
-					organization[0].allowedEmailDomain,
-				);
-				return (
-					<div className="flex flex-col justify-center items-center p-4 min-h-screen text-center">
-						<h1 className="mb-4 text-2xl font-bold">Access Restricted</h1>
-						<p className="mb-2 text-gray-10">
-							This video is only accessible to members of this organization.
-						</p>
-						<p className="text-gray-600">
-							Please sign in with your organization email address to access this
-							content.
-						</p>
-					</div>
-				);
-			}
-		}
-	}
-
 	if (
 		!video.hasActiveUpload &&
 		video.transcriptionStatus !== "COMPLETE" &&
