@@ -129,6 +129,42 @@ async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
 	return formatToWebVTT(result);
 }
 
+async function getAccessibleVideoUrl(
+	bucket: any,
+	userId: string,
+	videoId: string,
+): Promise<{ videoUrl: string; videoKey: string }> {
+	const candidateKeys = [
+		`${userId}/${videoId}/result.mp4`,
+		`${userId}/${videoId}/raw-upload.mp4`,
+	];
+
+	for (const videoKey of candidateKeys) {
+		const videoUrl = await bucket.getSignedObjectUrl(videoKey).pipe(runPromise);
+		try {
+			const response = await fetch(videoUrl, {
+				method: "GET",
+				headers: { range: "bytes=0-0" },
+			});
+			if (response.ok) {
+				console.log(
+					`[transcribe-direct] Using video source ${videoKey} for transcription`,
+				);
+				return { videoUrl, videoKey };
+			}
+			console.log(
+				`[transcribe-direct] Video source ${videoKey} inaccessible: ${response.status}`,
+			);
+		} catch (error) {
+			console.log(
+				`[transcribe-direct] Video source ${videoKey} check failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	throw new Error("Video file not accessible");
+}
+
 export async function transcribeVideoDirect(
 	payload: TranscribeDirectPayload,
 ): Promise<{ success: boolean; message: string }> {
@@ -192,33 +228,34 @@ export async function transcribeVideoDirect(
 			Option.fromNullable(bucketId),
 		).pipe(runPromise);
 
-		const videoKey = `${userId}/${videoId}/result.mp4`;
-		const videoUrl = await bucket.getSignedObjectUrl(videoKey).pipe(runPromise);
-
-		const response = await fetch(videoUrl, {
-			method: "GET",
-			headers: { range: "bytes=0-0" },
-		});
-		if (!response.ok) {
-			throw new Error("Video file not accessible");
-		}
+		const { videoUrl } = await getAccessibleVideoUrl(bucket, userId, videoId);
 
 		const useMediaServer = isMediaServerConfigured();
 		let hasAudio: boolean;
 		let audioBuffer: Buffer;
+		let usedMediaServer = false;
 
 		if (useMediaServer) {
-			console.log(`[transcribe-direct] Using media server for audio extraction`);
-			hasAudio = await checkHasAudioTrackViaMediaServer(videoUrl);
-			if (!hasAudio) {
-				await db()
-					.update(videos)
-					.set({ transcriptionStatus: "NO_AUDIO" })
-					.where(eq(videos.id, videoId as Video.VideoId));
-				return { success: true, message: "Video has no audio track - skipped" };
+			try {
+				console.log(`[transcribe-direct] Using media server for audio extraction`);
+				hasAudio = await checkHasAudioTrackViaMediaServer(videoUrl);
+				if (!hasAudio) {
+					await db()
+						.update(videos)
+						.set({ transcriptionStatus: "NO_AUDIO" })
+						.where(eq(videos.id, videoId as Video.VideoId));
+					return { success: true, message: "Video has no audio track - skipped" };
+				}
+				audioBuffer = await extractAudioViaMediaServer(videoUrl);
+				usedMediaServer = true;
+			} catch (error) {
+				console.warn(
+					`[transcribe-direct] Media server extraction failed, falling back to local ffmpeg: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
-			audioBuffer = await extractAudioViaMediaServer(videoUrl);
-		} else {
+		}
+
+		if (!usedMediaServer) {
 			console.log(`[transcribe-direct] Using local ffmpeg for audio extraction`);
 			hasAudio = await checkHasAudioTrack(videoUrl);
 			if (!hasAudio) {
