@@ -43,19 +43,28 @@ export class ContainerMetadata extends Effect.Service<ContainerMetadata>()(
 		effect: Effect.gen(function* () {
 			const containerMetadata = yield* EcsContainerMetadata;
 			const metadataUri = containerMetadata.metadataUri;
-			const ipAddress = yield* Option.match(metadataUri, {
-				onNone: () => Effect.succeed("0.0.0.0"),
-				onSome: (uri) =>
-					Effect.tryPromise({
-						try: async () => {
-							const response = await fetch(`${uri}/task`);
-							const data = await response.json();
-							return data.Containers[0].Networks[0].IPv4Addresses[0] as string;
-						},
-						catch: (error) => {
-							console.error("error", error);
-							return new FetchIpError();
-						},
+			// Allow an explicit override so non-ECS environments (Railway, Fly, plain Docker)
+			// can advertise a routable address instead of 0.0.0.0, which other services
+			// cannot dial.
+			const override = yield* Config.option(Config.string("RUNNER_HOST"));
+			const ipAddress = yield* Option.match(override, {
+				onSome: (host) => Effect.succeed(host),
+				onNone: () =>
+					Option.match(metadataUri, {
+						onNone: () => Effect.succeed("0.0.0.0"),
+						onSome: (uri) =>
+							Effect.tryPromise({
+								try: async () => {
+									const response = await fetch(`${uri}/task`);
+									const data = await response.json();
+									return data.Containers[0].Networks[0]
+										.IPv4Addresses[0] as string;
+								},
+								catch: (error) => {
+									console.error("error", error);
+									return new FetchIpError();
+								},
+							}),
 					}),
 			});
 
