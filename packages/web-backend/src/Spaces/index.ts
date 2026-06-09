@@ -26,6 +26,11 @@ export class Spaces extends Effect.Service<Spaces>()("Spaces", {
 							name: Db.spaces.name,
 							organizationId: Db.spaces.organizationId,
 							createdById: Db.spaces.createdById,
+							iconUrl: Db.spaces.iconUrl,
+							settings: Db.spaces.settings,
+							hasPassword: Dz.sql`${Db.spaces.password} IS NOT NULL`.mapWith(
+								Boolean,
+							),
 						})
 						.from(Db.spaces)
 						.where(Dz.eq(Db.spaces.id, spaceOrOrgId))
@@ -50,7 +55,12 @@ export class Spaces extends Effect.Service<Spaces>()("Spaces", {
 			]);
 			if (space)
 				return yield* Effect.succeed({ variant: "space" as const, space }).pipe(
-					Policy.withPolicy(spacesPolicy.isMember(space.id)),
+					Policy.withPolicy(
+						Policy.any(
+							spacesPolicy.isMember(space.id),
+							orgsPolicy.isAdminOrOwner(space.organizationId),
+						),
+					),
 				);
 			if (org)
 				return yield* Effect.succeed({

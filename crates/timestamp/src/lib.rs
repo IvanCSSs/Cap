@@ -10,6 +10,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 
+mod master_clock;
+pub use master_clock::*;
+
 #[derive(Clone, Copy, Debug)]
 pub enum Timestamp {
     Instant(Instant),
@@ -117,7 +120,7 @@ impl std::ops::Sub<Duration> for Timestamp {
 
     fn sub(self, rhs: Duration) -> Self::Output {
         match self {
-            Timestamp::Instant(i) => Timestamp::Instant(i.checked_sub(rhs).unwrap()),
+            Timestamp::Instant(i) => Timestamp::Instant(i.checked_sub(rhs).unwrap_or(i)),
             Timestamp::SystemTime(t) => Timestamp::SystemTime(t - rhs),
             #[cfg(windows)]
             Timestamp::PerformanceCounter(c) => Timestamp::PerformanceCounter(c - rhs),

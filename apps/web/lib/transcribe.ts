@@ -1,5 +1,5 @@
 import { db } from "@cap/database";
-import { organizations, s3Buckets, videos } from "@cap/database/schema";
+import { organizations, videos, videoUploads } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -34,12 +34,10 @@ export async function transcribeVideo(
 	const query = await db()
 		.select({
 			video: videos,
-			bucket: s3Buckets,
 			settings: videos.settings,
 			orgSettings: organizations.settings,
 		})
 		.from(videos)
-		.leftJoin(s3Buckets, eq(videos.bucket, s3Buckets.id))
 		.leftJoin(organizations, eq(videos.orgId, organizations.id))
 		.where(eq(videos.id, videoId));
 
@@ -92,6 +90,23 @@ export async function transcribeVideo(
 		return {
 			success: true,
 			message: "Transcription already completed or in progress",
+		};
+	}
+
+	const upload = await db()
+		.select({ phase: videoUploads.phase })
+		.from(videoUploads)
+		.where(eq(videoUploads.videoId, videoId))
+		.limit(1);
+
+	if (
+		upload[0]?.phase === "uploading" ||
+		upload[0]?.phase === "processing" ||
+		upload[0]?.phase === "generating_thumbnail"
+	) {
+		return {
+			success: true,
+			message: "Video upload is still in progress",
 		};
 	}
 

@@ -21,6 +21,7 @@ import {
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 
 import { generalSettingsStore } from "~/store";
+import { defaultKeyboardSettings } from "~/store/keyboard";
 
 import { createPresets } from "~/utils/createPresets";
 import { createCustomDomainQuery } from "~/utils/queries";
@@ -44,22 +45,46 @@ import {
 	type TimelineConfiguration,
 	type XY,
 } from "~/utils/tauri";
-import {
-	cleanup as cleanupCropVideoPreloader,
-	preloadCropVideoMetadata,
-} from "./cropVideoPreloader";
 import type { MaskSegment } from "./masks";
 import type { TextSegment } from "./text";
+import {
+	getUsedTrackCount,
+	normalizeTrackSegments,
+	sortTrackSegments,
+} from "./timelineTracks";
 import { createProgressBar } from "./utils";
 
-export type CurrentDialog =
+export type ModalDialog =
 	| { type: "createPreset" }
 	| { type: "renamePreset"; presetIndex: number }
 	| { type: "deletePreset"; presetIndex: number }
-	| { type: "crop"; position: XY<number>; size: XY<number> }
-	| { type: "export" };
+	| {
+			type: "crop";
+			position: XY<number>;
+			size: XY<number>;
+			previewUrl?: string | null;
+	  };
+
+export type LayoutMode = { type: "export" } | { type: "transcript" };
+
+export type CurrentDialog = ModalDialog | LayoutMode;
 
 export type DialogState = { open: false } | ({ open: boolean } & CurrentDialog);
+export type OpenLayoutMode = { open: true } & LayoutMode;
+export type OpenModalDialog = { open: true } & ModalDialog;
+
+const LAYOUT_MODE_TYPES: Set<CurrentDialog["type"]> = new Set([
+	"export",
+	"transcript",
+]);
+
+export function isLayoutMode(d: DialogState): d is OpenLayoutMode {
+	return d.open && "type" in d && LAYOUT_MODE_TYPES.has(d.type);
+}
+
+export function isModalDialog(d: DialogState): d is OpenModalDialog {
+	return d.open && "type" in d && !LAYOUT_MODE_TYPES.has(d.type);
+}
 
 export const FPS = 60;
 
@@ -86,7 +111,14 @@ export const getPreviewResolution = (
 	return { x: width, y: height };
 };
 
-export type TimelineTrackType = "clip" | "text" | "zoom" | "scene" | "mask";
+export type TimelineTrackType =
+	| "clip"
+	| "caption"
+	| "keyboard"
+	| "text"
+	| "zoom"
+	| "scene"
+	| "mask";
 
 export const MAX_ZOOM_IN = 3;
 const PROJECT_SAVE_DEBOUNCE_MS = 250;
@@ -139,27 +171,43 @@ function withCornerDefaults<
 export function normalizeProject(
 	config: ProjectConfiguration,
 ): EditorProjectConfiguration {
+	const keyboard =
+		config.keyboard && config.keyboard.settings.position === "above-captions"
+			? {
+					...config.keyboard,
+					settings: {
+						...config.keyboard.settings,
+						position: "bottom-center",
+					},
+				}
+			: config.keyboard;
+
 	const timeline = config.timeline
 		? {
 				...config.timeline,
 				sceneSegments: config.timeline.sceneSegments ?? [],
-				maskSegments:
+				captionSegments: config.timeline.captionSegments ?? [],
+				keyboardSegments: config.timeline.keyboardSegments ?? [],
+				maskSegments: normalizeTrackSegments(
 					(
 						config.timeline as TimelineConfiguration & {
 							maskSegments?: MaskSegment[];
 						}
 					).maskSegments ?? [],
-				textSegments:
+				),
+				textSegments: normalizeTrackSegments(
 					(
 						config.timeline as TimelineConfiguration & {
 							textSegments?: TextSegment[];
 						}
 					).textSegments ?? [],
+				),
 			}
 		: undefined;
 
 	return {
 		...config,
+		keyboard,
 		timeline,
 		background: withCornerDefaults(config.background),
 		camera: withCornerDefaults(config.camera),
@@ -177,6 +225,8 @@ export function serializeProjectConfiguration(
 	const timeline = project.timeline
 		? {
 				...project.timeline,
+				captionSegments: project.timeline.captionSegments ?? [],
+				keyboardSegments: project.timeline.keyboardSegments ?? [],
 				maskSegments: project.timeline.maskSegments ?? [],
 				textSegments: project.timeline.textSegments ?? [],
 			}
@@ -245,14 +295,7 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			deleteClipSegment: (segmentIndex: number) => {
 				if (!project.timeline) return;
 				const segment = project.timeline.segments[segmentIndex];
-				if (
-					!segment ||
-					!segment.recordingSegment === undefined ||
-					project.timeline.segments.filter(
-						(s) => s.recordingSegment === segment.recordingSegment,
-					).length < 2
-				)
-					return;
+				if (!segment || project.timeline.segments.length < 2) return;
 
 				batch(() => {
 					setProject(
@@ -284,6 +327,7 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 							end: segment.end,
 						});
 						segments[index].end = segment.start + time;
+						sortTrackSegments(segments);
 					}),
 				);
 			},
@@ -323,6 +367,7 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 							end: segment.end,
 						});
 						segments[index].end = segment.start + time;
+						sortTrackSegments(segments);
 					}),
 				);
 			},
@@ -339,6 +384,7 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 								)
 								.sort((a, b) => b - a);
 							for (const i of sorted) segments.splice(i, 1);
+							normalizeTrackSegments(segments);
 						}),
 					);
 					setEditorState("timeline", "selection", null);
@@ -362,6 +408,7 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 							end: segment.end,
 						});
 						segments[index].end = segment.start + time;
+						sortTrackSegments(segments);
 					}),
 				);
 			},
@@ -370,6 +417,87 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 					setProject(
 						"timeline",
 						"textSegments",
+						produce((segments) => {
+							if (!segments) return;
+							const sorted = [...new Set(segmentIndices)]
+								.filter(
+									(i) => Number.isInteger(i) && i >= 0 && i < segments.length,
+								)
+								.sort((a, b) => b - a);
+							for (const i of sorted) segments.splice(i, 1);
+							normalizeTrackSegments(segments);
+						}),
+					);
+					setEditorState("timeline", "selection", null);
+				});
+			},
+			splitKeyboardSegment: (index: number, time: number) => {
+				setProject(
+					"timeline",
+					"keyboardSegments",
+					produce((segments) => {
+						const segment = segments?.[index];
+						if (!segment) return;
+
+						const duration = segment.end - segment.start;
+						const remaining = duration - time;
+						if (time < 0.3 || remaining < 0.3) return;
+
+						segments.splice(index + 1, 0, {
+							...segment,
+							id: `kb-split-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+							start: segment.start + time,
+							end: segment.end,
+						});
+						segments[index].end = segment.start + time;
+					}),
+				);
+			},
+			deleteKeyboardSegments: (segmentIndices: number[]) => {
+				batch(() => {
+					setProject(
+						"timeline",
+						"keyboardSegments",
+						produce((segments) => {
+							if (!segments) return;
+							const sorted = [...new Set(segmentIndices)]
+								.filter(
+									(i) => Number.isInteger(i) && i >= 0 && i < segments.length,
+								)
+								.sort((a, b) => b - a);
+							for (const i of sorted) segments.splice(i, 1);
+						}),
+					);
+					setEditorState("timeline", "selection", null);
+				});
+			},
+			splitCaptionSegment: (index: number, time: number) => {
+				setProject(
+					"timeline",
+					"captionSegments",
+					produce((segments) => {
+						const segment = segments?.[index];
+						if (!segment) return;
+
+						const duration = segment.end - segment.start;
+						const remaining = duration - time;
+						if (time < 0.5 || remaining < 0.5) return;
+
+						segments.splice(index + 1, 0, {
+							...segment,
+							id: `cap-split-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+							start: segment.start + time,
+							end: segment.end,
+						});
+						segments[index].end = segment.start + time;
+					}),
+				);
+			},
+			deleteCaptionSegments: (segmentIndices: number[]) => {
+				batch(() => {
+					setProject(
+						"timeline",
+						"captionSegments",
 						produce((segments) => {
 							if (!segments) return;
 							const sorted = [...new Set(segmentIndices)]
@@ -458,6 +586,16 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 						for (const textSegment of timeline.textSegments) {
 							textSegment.start += diff(textSegment.start);
 							textSegment.end += diff(textSegment.end);
+						}
+
+						for (const captionSegment of timeline.captionSegments ?? []) {
+							captionSegment.start += diff(captionSegment.start);
+							captionSegment.end += diff(captionSegment.end);
+						}
+
+						for (const keyboardSegment of timeline.keyboardSegments ?? []) {
+							keyboardSegment.start += diff(keyboardSegment.start);
+							keyboardSegment.end += diff(keyboardSegment.end);
 						}
 
 						segment.timescale = timescale;
@@ -629,10 +767,17 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			};
 		}
 
-		const initialMaskTrackEnabled =
-			(project.timeline?.maskSegments?.length ?? 0) > 0;
-		const initialTextTrackEnabled =
-			(project.timeline?.textSegments?.length ?? 0) > 0;
+		const initialMaskTrackCount = getUsedTrackCount(
+			project.timeline?.maskSegments ?? [],
+		);
+		const initialTextTrackCount = getUsedTrackCount(
+			project.timeline?.textSegments ?? [],
+		);
+		const initialCaptionTrackVisible =
+			project.captions?.settings.enabled ??
+			(project.timeline?.captionSegments?.length ?? 0) > 0;
+		const initialKeyboardTrackVisible =
+			project.keyboard?.settings.enabled ?? false;
 
 		const [editorState, setEditorState] = createStore({
 			previewTime: null as number | null,
@@ -643,6 +788,8 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 				isDownloading: false,
 				downloadProgress: 0,
 				downloadingModel: null as string | null,
+				isStale: false,
+				staleDismissed: false,
 			},
 			timeline: {
 				interactMode: "seek" as "seek" | "split",
@@ -652,6 +799,8 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 					| { type: "clip"; indices: number[] }
 					| { type: "scene"; indices: number[] }
 					| { type: "mask"; indices: number[] }
+					| { type: "caption"; indices: number[] }
+					| { type: "keyboard"; indices: number[] }
 					| { type: "text"; indices: number[] },
 				transform: {
 					// visible seconds
@@ -691,12 +840,16 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 				},
 				tracks: {
 					clip: true,
+					caption: initialCaptionTrackVisible,
+					keyboard: initialKeyboardTrackVisible,
 					zoom: true,
 					scene: true,
-					mask: initialMaskTrackEnabled,
-					text: initialTextTrackEnabled,
+					mask: initialMaskTrackCount,
+					text: initialTextTrackCount,
 				},
 				hoveredTrack: null as null | TimelineTrackType,
+				hoveredMaskIndex: null as number | null,
+				hoveredMaskTime: null as number | null,
 			},
 		});
 
@@ -705,6 +858,83 @@ export const [EditorContextProvider, useEditorContext] = createContextProvider(
 			commands.getSystemAudioWaveforms(),
 		);
 		const customDomain = createCustomDomainQuery();
+		const hasRecordedKeyboardEvents = createMemo(() => {
+			const meta = props.meta();
+			if (meta.type === "single") return false;
+			return meta.segments.some((segment) => !!segment.keyboard);
+		});
+		const [didInitializeKeyboardSegments, setDidInitializeKeyboardSegments] =
+			createSignal(false);
+
+		createEffect(() => {
+			if (didInitializeKeyboardSegments()) return;
+			if (!project.timeline) return;
+			if (!hasRecordedKeyboardEvents()) {
+				setDidInitializeKeyboardSegments(true);
+				return;
+			}
+			if ((project.timeline?.keyboardSegments?.length ?? 0) > 0) {
+				setDidInitializeKeyboardSegments(true);
+				return;
+			}
+
+			setDidInitializeKeyboardSegments(true);
+
+			void (async () => {
+				try {
+					const segments = await commands.generateKeyboardSegments(
+						defaultKeyboardSettings.groupingThresholdMs,
+						defaultKeyboardSettings.lingerDuration * 1000,
+						defaultKeyboardSettings.showModifiers,
+						defaultKeyboardSettings.showSpecialKeys,
+					);
+
+					if (segments.length < 1) return;
+
+					batch(() => {
+						if (!project.keyboard) {
+							setProject("keyboard", {
+								settings: defaultKeyboardSettings,
+							});
+						}
+						setProject("timeline", "keyboardSegments", segments);
+					});
+				} catch (error) {
+					console.error("Failed to initialize keyboard segments", error);
+				}
+			})();
+		});
+
+		createEffect(
+			on(
+				() => {
+					const segs = project.timeline?.segments;
+					if (!segs || segs.length === 0) return "";
+					return segs
+						.map(
+							(s) =>
+								`${s.start}|${s.end}|${s.timescale}|${s.recordingSegment ?? 0}`,
+						)
+						.join(",");
+				},
+				(current, prev) => {
+					if (prev === undefined || prev === "") return;
+					if (current === prev) return;
+
+					const hasCaptions =
+						(project.timeline?.captionSegments?.length ?? 0) > 0 ||
+						(project.captions?.segments?.length ?? 0) > 0;
+
+					if (hasCaptions) {
+						batch(() => {
+							setEditorState("captions", "isStale", true);
+							setEditorState("captions", "staleDismissed", false);
+						});
+					}
+				},
+				{ defer: true },
+			),
+		);
 
 		return {
 			...editorInstanceContext,
@@ -745,7 +975,9 @@ function transformMeta({ pretty_name, ...rawMeta }: RecordingMeta) {
 		throw new Error("Instant mode recordings cannot be edited");
 	}
 
-	let meta;
+	let meta:
+		| (MultipleSegments & { type: "multiple" })
+		| (SingleSegment & { type: "single" });
 
 	if ("segments" in rawMeta) {
 		meta = {
@@ -775,118 +1007,127 @@ function transformMeta({ pretty_name, ...rawMeta }: RecordingMeta) {
 			if (meta.type === "single") return !!meta.audio;
 			return !!meta.segments[0].mic;
 		})(),
+		hasRecordedCursorData: (() => {
+			if (meta.type === "single") return !!meta.cursor;
+			return meta.segments.some((s) => !!s.cursor);
+		})(),
 	};
 }
 
 export type TransformedMeta = ReturnType<typeof transformMeta>;
 
-export const [EditorInstanceContextProvider, useEditorInstanceContext] =
-	createContextProvider(() => {
-		const [latestFrame, setLatestFrame] = createLazySignal<FrameData>();
+const createEditorInstanceContext = () => {
+	const [latestFrame, setLatestFrame] = createLazySignal<FrameData>();
 
-		const [_isConnected, setIsConnected] = createSignal(false);
-		const [isWorkerReady, setIsWorkerReady] = createSignal(false);
-		const [canvasControls, setCanvasControls] =
-			createSignal<CanvasControls | null>(null);
-		const [performanceMode, setPerformanceMode] = createSignal(false);
+	const [_isConnected, setIsConnected] = createSignal(false);
+	const [isWorkerReady, setIsWorkerReady] = createSignal(false);
+	const [canvasControls, setCanvasControls] =
+		createSignal<CanvasControls | null>(null);
+	const [performanceMode, setPerformanceMode] = createSignal(false);
 
-		let disposeWorkerReadyEffect: (() => void) | undefined;
+	let disposeWorkerReadyEffect: (() => void) | undefined;
 
-		onCleanup(() => {
-			disposeWorkerReadyEffect?.();
-			cleanupCropVideoPreloader();
-		});
+	onCleanup(() => {
+		disposeWorkerReadyEffect?.();
+		canvasControls()?.dispose();
+	});
 
-		const [editorInstance, { refetch: refetchEditorInstance }] = createResource(
-			async () => {
-				console.log("[Editor] Creating editor instance...");
+	const [editorInstance, { refetch: refetchEditorInstance }] = createResource(
+		async () => {
+			console.log("[Editor] Creating editor instance...");
 
-				let instance;
-				let lastError;
-				for (let attempt = 0; attempt < 5; attempt++) {
-					try {
-						instance = await commands.createEditorInstance();
+			let instance: SerializedEditorInstance | undefined;
+			let lastError: unknown;
+			for (let attempt = 0; attempt < 5; attempt++) {
+				try {
+					instance = await commands.createEditorInstance();
+					break;
+				} catch (e) {
+					lastError = e;
+					const errorMessage = e instanceof Error ? e.message : String(e);
+					if (/may need to be recovered/i.test(errorMessage)) {
 						break;
-					} catch (e) {
-						lastError = e;
-						console.warn(
-							`[Editor] Attempt ${attempt + 1}/5 failed:`,
-							e,
-							"- retrying...",
-						);
-						await new Promise((resolve) =>
-							setTimeout(resolve, 500 * (attempt + 1)),
-						);
 					}
+					console.warn(
+						`[Editor] Attempt ${attempt + 1}/5 failed:`,
+						e,
+						"- retrying...",
+					);
+					await new Promise((resolve) =>
+						setTimeout(resolve, 500 * (attempt + 1)),
+					);
 				}
+			}
 
-				if (!instance) {
-					throw lastError;
-				}
+			if (!instance) {
+				throw lastError;
+			}
 
-				console.log("[Editor] Editor instance created, setting up WebSocket");
+			console.log("[Editor] Editor instance created, setting up WebSocket");
 
-				preloadCropVideoMetadata(
-					`${instance.path}/content/segments/segment-0/display.mp4`,
-				);
-
-				const requestFrame = () => {
-					events.renderFrameEvent.emit({
-						frame_number: 0,
-						fps: FPS,
-						resolution_base: getPreviewResolution(DEFAULT_PREVIEW_QUALITY),
-					});
-				};
-
-				const [ws, _wsConnected, workerReady, controls] = createImageDataWS(
-					instance.framesSocketUrl,
-					setLatestFrame,
-					requestFrame,
-				);
-
-				setCanvasControls(controls);
-
-				disposeWorkerReadyEffect = createRoot((dispose) => {
-					createEffect(() => {
-						setIsWorkerReady(workerReady());
-					});
-					return dispose;
+			const requestFrame = () => {
+				events.renderFrameEvent.emit({
+					frame_number: 0,
+					fps: FPS,
+					resolution_base: getPreviewResolution(DEFAULT_PREVIEW_QUALITY),
 				});
+			};
 
-				ws.addEventListener("open", () => {
-					setIsConnected(true);
-					requestFrame();
+			const [ws, _wsConnected, workerReady, controls] = createImageDataWS(
+				instance.framesSocketUrl,
+				setLatestFrame,
+				requestFrame,
+			);
+
+			setCanvasControls(controls);
+
+			disposeWorkerReadyEffect = createRoot((dispose) => {
+				createEffect(() => {
+					setIsWorkerReady(workerReady());
 				});
+				return dispose;
+			});
 
-				ws.addEventListener("close", () => {
-					setIsConnected(false);
-				});
+			ws.addEventListener("open", () => {
+				setIsConnected(true);
+				requestFrame();
+			});
 
-				return instance;
-			},
-		);
+			ws.addEventListener("close", () => {
+				setIsConnected(false);
+			});
 
-		const metaQuery = createQuery(() => ({
-			queryKey: ["editor", "meta"],
-			queryFn: editorInstance()
-				? () => commands.getEditorMeta().then(transformMeta)
-				: skipToken,
-			cacheTime: 0,
-			staleTime: 0,
-		}));
+			return instance;
+		},
+	);
 
-		return {
-			editorInstance,
-			refetchEditorInstance,
-			latestFrame,
-			presets: createPresets(),
-			metaQuery,
-			isWorkerReady,
-			canvasControls,
-			performanceMode,
-			setPerformanceMode,
-		};
-	}, null!);
+	const metaQuery = createQuery(() => ({
+		queryKey: ["editor", "meta"],
+		queryFn: editorInstance.latest
+			? () => commands.getEditorMeta().then(transformMeta)
+			: skipToken,
+		cacheTime: 0,
+		staleTime: 0,
+	}));
+
+	return {
+		editorInstance,
+		refetchEditorInstance,
+		latestFrame,
+		presets: createPresets(),
+		metaQuery,
+		isWorkerReady,
+		canvasControls,
+		performanceMode,
+		setPerformanceMode,
+	};
+};
+
+export const [EditorInstanceContextProvider, useEditorInstanceContext] =
+	createContextProvider(
+		createEditorInstanceContext,
+		null as unknown as ReturnType<typeof createEditorInstanceContext>,
+	);
 
 function createStoreHistory<T extends Static>(
 	...[state, setState]: ReturnType<typeof createStore<T>>
@@ -946,6 +1187,27 @@ type Static<T = unknown> =
 	  }
 	| T[];
 
+type TimelineContextValue = {
+	duration: Accessor<number>;
+	secsPerPixel: Accessor<number>;
+	timelineBounds: Readonly<NullableBounds>;
+};
+
+type TrackContextValue = {
+	secsPerPixel: Accessor<number>;
+	trackBounds: Readonly<NullableBounds>;
+	trackState: {
+		draggingSegment: boolean;
+	};
+	setTrackState: ReturnType<
+		typeof createStore<{ draggingSegment: boolean }>
+	>[1];
+};
+
+type SegmentContextValue = {
+	width: Accessor<number>;
+};
+
 export const [TimelineContextProvider, useTimelineContext] =
 	createContextProvider(
 		(props: {
@@ -959,7 +1221,7 @@ export const [TimelineContextProvider, useTimelineContext] =
 				timelineBounds: props.timelineBounds,
 			};
 		},
-		null!,
+		null as unknown as TimelineContextValue,
 	);
 
 export const [TrackContextProvider, useTrackContext] = createContextProvider(
@@ -981,10 +1243,13 @@ export const [TrackContextProvider, useTrackContext] = createContextProvider(
 			setTrackState,
 		};
 	},
-	null!,
+	null as unknown as TrackContextValue,
 );
 
 export const [SegmentContextProvider, useSegmentContext] =
-	createContextProvider((props: { width: Accessor<number> }) => {
-		return props;
-	}, null!);
+	createContextProvider(
+		(props: { width: Accessor<number> }) => {
+			return props;
+		},
+		null as unknown as SegmentContextValue,
+	);

@@ -1,5 +1,3 @@
-"use client";
-
 import { Logo } from "@cap/ui";
 import Link from "next/link";
 
@@ -36,7 +34,6 @@ const footerLinks = {
 		{ label: "FAQs", href: "/faq" },
 		{ label: "Self-hosting", href: "/self-hosting" },
 		{ label: "Email Support", href: "mailto:hello@cap.so" },
-		{ label: "Help Center", href: "https://help.cap.so" },
 		{ label: "Trust Portal", href: "https://trust.cap.so" },
 		{
 			label: "Chat Support",
@@ -115,7 +112,6 @@ export const Footer = () => {
 				className="mx-auto max-w-[1400px] bg-gray-1 border-[1px] border-gray-200 p-8 lg:p-12 rounded-[20px] mb-10 relative overflow-hidden"
 			>
 				<div className="flex relative z-10 flex-col-reverse items-center">
-					{/* Logo Column */}
 					<div className="flex-1 mt-10 space-y-2 text-center md:mt-0">
 						<Logo className="w-[104px] h-auto mx-auto" />
 						<div className="w-full">
@@ -128,19 +124,20 @@ export const Footer = () => {
 						<p className="pt-4 text-sm text-gray-9">
 							© Cap Software, Inc. {new Date().getFullYear()}.
 						</p>
-						<div className="flex justify-center pt-6 space-x-10">
+						<div className="flex flex-wrap justify-center gap-x-10 gap-y-3 pt-6">
 							<a className="text-sm text-gray-8" href="/terms">
 								Terms of Service
 							</a>
 							<a className="text-sm text-gray-8" href="/privacy">
 								Privacy Policy
 							</a>
+							<a className="text-sm text-gray-8" href="/dpa">
+								Data Processing Agreement
+							</a>
 						</div>
 					</div>
 
-					{/* Links Container Column */}
 					<div className="grid grid-cols-1 gap-10 w-full md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-						{/* Product Column */}
 						<div className="space-y-2">
 							<h3 className="text-lg font-semibold text-gray-12">Product</h3>
 							<ul className="grid grid-cols-1 gap-2 pt-2">
@@ -177,7 +174,6 @@ export const Footer = () => {
 							</ul>
 						</div>
 
-						{/* Help Column */}
 						<div className="space-y-2">
 							<h3 className="text-lg font-semibold text-gray-12">Cap</h3>
 							<ul className="grid grid-cols-1 gap-2 pt-2">
@@ -212,7 +208,6 @@ export const Footer = () => {
 							</ul>
 						</div>
 
-						{/* Socials Column */}
 						<div className="space-y-2">
 							<h3 className="text-lg font-semibold text-gray-12">Socials</h3>
 							<ul className="grid grid-cols-1 gap-2 pt-2">

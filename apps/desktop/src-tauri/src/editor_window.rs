@@ -1,5 +1,5 @@
 use std::{collections::HashMap, ops::Deref, path::PathBuf, sync::Arc, time::Instant};
-use tauri::{AppHandle, Manager, Runtime, Window, ipc::CommandArg};
+use tauri::{AppHandle, Listener, Manager, Runtime, Window, ipc::CommandArg};
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -14,6 +14,8 @@ pub struct EditorInstance {
     inner: Arc<cap_editor::EditorInstance>,
     pub ws_port: u16,
     pub ws_shutdown_token: CancellationToken,
+    app_handle: AppHandle,
+    render_frame_event_id: tauri::EventId,
 }
 
 type PendingResult = Result<Arc<EditorInstance>, String>;
@@ -26,7 +28,7 @@ async fn do_prewarm(app: AppHandle, path: PathBuf) -> PendingResult {
     let (frame_tx, frame_rx) = watch::channel(None);
 
     let (ws_port, ws_shutdown_token) = create_watch_frame_ws(frame_rx).await;
-    let inner = create_editor_instance_impl(
+    let (inner, render_frame_event_id) = create_editor_instance_impl(
         &app,
         path,
         Box::new(move |output| {
@@ -37,7 +39,7 @@ async fn do_prewarm(app: AppHandle, path: PathBuf) -> PendingResult {
                         GpuOutputFormat::Rgba => WSFrameFormat::Rgba,
                     };
                     WSFrame {
-                        data: frame.data,
+                        data: Arc::new(frame.data.into_vec()),
                         width: frame.width,
                         height: frame.height,
                         stride: frame.y_stride,
@@ -67,6 +69,8 @@ async fn do_prewarm(app: AppHandle, path: PathBuf) -> PendingResult {
         inner,
         ws_port,
         ws_shutdown_token,
+        app_handle: app,
+        render_frame_event_id,
     }))
 }
 
@@ -110,6 +114,85 @@ impl PendingEditorInstances {
         let mut instances = self.0.write().await;
         instances.remove(window_label)
     }
+
+    pub async fn cancel_prewarm(&self, window_label: &str) {
+        let mut instances = self.0.write().await;
+        if let Some(mut rx) = instances.remove(window_label) {
+            tokio::spawn(async move {
+                let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let instance_to_dispose = {
+                            let borrowed = rx.borrow_and_update().clone();
+                            match borrowed {
+                                Some(Ok(instance)) => Some(instance),
+                                Some(Err(_)) => break,
+                                None => None,
+                            }
+                        };
+
+                        if let Some(instance) = instance_to_dispose {
+                            instance.dispose().await;
+                            break;
+                        }
+
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                if timeout.await.is_err() {
+                    tracing::warn!(
+                        "Timed out waiting for prewarmed editor instance to complete for cleanup"
+                    );
+                }
+            });
+        }
+    }
+
+    pub async fn dispose_all(app: &AppHandle) {
+        let Some(pending) = app.try_state::<Self>() else {
+            return;
+        };
+
+        let pending = {
+            let mut instances = pending.0.write().await;
+            std::mem::take(&mut *instances)
+        };
+
+        let count = pending.len();
+        for (_, mut rx) in pending {
+            let result = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                loop {
+                    let instance_to_dispose = {
+                        let borrowed = rx.borrow_and_update().clone();
+                        match borrowed {
+                            Some(Ok(instance)) => Some(instance),
+                            Some(Err(_)) => break,
+                            None => None,
+                        }
+                    };
+
+                    if let Some(instance) = instance_to_dispose {
+                        instance.dispose().await;
+                        break;
+                    }
+
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+
+            if result.is_err() {
+                tracing::warn!("Timed out disposing pending editor instance during app exit");
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(count, "Disposed pending editor instances during app exit");
+        }
+    }
 }
 
 impl EditorInstance {
@@ -117,6 +200,14 @@ impl EditorInstance {
         self.inner.dispose().await;
 
         self.ws_shutdown_token.cancel();
+        self.app_handle.unlisten(self.render_frame_event_id);
+    }
+}
+
+impl Drop for EditorInstance {
+    fn drop(&mut self) {
+        self.ws_shutdown_token.cancel();
+        self.app_handle.unlisten(self.render_frame_event_id);
     }
 }
 
@@ -162,9 +253,17 @@ impl<'de, R: Runtime> CommandArg<'de, R> for WindowEditorInstance {
         let Some(instances) = window.try_state::<EditorInstances>() else {
             return Err("editor instance registry unavailable".into());
         };
-        let instance = futures::executor::block_on(instances.0.read());
 
-        let Some(instance) = instance.get(window.label()).cloned() else {
+        // Avoid `futures::executor::block_on` on a tokio RwLock here. That can deadlock or
+        // panic when the IPC handler runs from inside the tokio runtime (release builds hit
+        // this path much more aggressively than dev builds and silently terminate the process).
+        // `try_read` is sync and never blocks; if the lock is contended we surface a transient
+        // error and let the frontend retry.
+        let Ok(instance_guard) = instances.0.try_read() else {
+            return Err("editor instance registry busy".into());
+        };
+
+        let Some(instance) = instance_guard.get(window.label()).cloned() else {
             return Err("editor instance unavailable".into());
         };
 
@@ -200,8 +299,10 @@ impl<'de, R: Runtime> CommandArg<'de, R> for OptionalWindowEditorInstance {
             return Ok(Self(None));
         };
 
-        let instance = futures::executor::block_on(instances.0.read());
-        Ok(Self(instance.get(window.label()).cloned()))
+        match instances.0.try_read() {
+            Ok(instance_guard) => Ok(Self(instance_guard.get(window.label()).cloned())),
+            Err(_) => Ok(Self(None)),
+        }
     }
 }
 
@@ -243,7 +344,8 @@ impl EditorInstances {
                 let (frame_tx, frame_rx) = watch::channel(None);
 
                 let (ws_port, ws_shutdown_token) = create_watch_frame_ws(frame_rx).await;
-                let inner = create_editor_instance_impl(
+                let app_handle = window.app_handle().clone();
+                let (inner, render_frame_event_id) = create_editor_instance_impl(
                     window.app_handle(),
                     path,
                     Box::new(move |output| {
@@ -254,7 +356,7 @@ impl EditorInstances {
                                     GpuOutputFormat::Rgba => WSFrameFormat::Rgba,
                                 };
                                 WSFrame {
-                                    data: frame.data,
+                                    data: Arc::new(frame.data.into_vec()),
                                     width: frame.width,
                                     height: frame.height,
                                     stride: frame.y_stride,
@@ -284,6 +386,8 @@ impl EditorInstances {
                     inner,
                     ws_port,
                     ws_shutdown_token,
+                    app_handle,
+                    render_frame_event_id,
                 });
 
                 entry.insert(instance.clone());
@@ -302,6 +406,26 @@ impl EditorInstances {
         let mut instances = instances.0.write().await;
         if let Some(instance) = instances.remove(window.label()) {
             instance.dispose().await;
+        }
+    }
+
+    pub async fn dispose_all(app: &AppHandle) {
+        let Some(instances) = app.try_state::<EditorInstances>() else {
+            return;
+        };
+
+        let instances = {
+            let mut instances = instances.0.write().await;
+            std::mem::take(&mut *instances)
+        };
+
+        let count = instances.len();
+        for (_, instance) in instances {
+            instance.dispose().await;
+        }
+
+        if count > 0 {
+            tracing::info!(count, "Disposed editor instances during app exit");
         }
     }
 }

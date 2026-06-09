@@ -27,6 +27,7 @@ type UploadProgress =
 			status: "error";
 			lastUpdated: Date;
 			errorMessage: string | null;
+			hasRawFallback: boolean;
 	  }
 	| {
 			status: "failed";
@@ -38,19 +39,19 @@ export function shouldDeferPlaybackSource(
 ): boolean {
 	return (
 		uploadProgress?.status === "fetching" ||
-		uploadProgress?.status === "uploading" ||
-		uploadProgress?.status === "processing" ||
-		uploadProgress?.status === "generating_thumbnail"
+		uploadProgress?.status === "uploading"
 	);
 }
 
 export function shouldReloadPlaybackAfterUploadCompletes(
 	previousUploadProgress: UploadProgress | null,
 	uploadProgress: UploadProgress | null,
-	videoLoaded: boolean,
+	options: { includeFetching?: boolean } = {},
 ): boolean {
 	return (
-		previousUploadProgress !== null && uploadProgress === null && !videoLoaded
+		previousUploadProgress !== null &&
+		(options.includeFetching || previousUploadProgress.status !== "fetching") &&
+		uploadProgress === null
 	);
 }
 
@@ -113,6 +114,10 @@ export function getStalledProcessingMessage(input: {
 		return "Video finishing stalled. Retry processing.";
 	}
 
+	if (input.phase === "complete" && ageMs > STALE_THUMBNAIL_MS) {
+		return "Video finishing stalled. Retry processing.";
+	}
+
 	return null;
 }
 
@@ -152,13 +157,20 @@ export function useUploadProgress(
 		processingProgress: query.data.processingProgress,
 	});
 
-	if (phase === "complete") return null;
+	if (phase === "complete") {
+		return {
+			status: "generating_thumbnail",
+			lastUpdated,
+			progress: 100,
+		};
+	}
 
 	if (phase === "error") {
 		return {
 			status: "error",
 			lastUpdated,
 			errorMessage: Option.getOrNull(query.data.processingError),
+			hasRawFallback: query.data.hasRawFallback,
 		};
 	}
 
@@ -167,6 +179,7 @@ export function useUploadProgress(
 			status: "error",
 			lastUpdated,
 			errorMessage: stalledProcessingMessage,
+			hasRawFallback: query.data.hasRawFallback,
 		};
 	}
 

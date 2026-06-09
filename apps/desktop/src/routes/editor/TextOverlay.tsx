@@ -314,7 +314,7 @@ function TextSegmentOverlay(props: {
 				startSize: { ...seg.size },
 			};
 		},
-		(e, { startPos, startSize }, initialMouse) => {
+		(e, { startPos }, initialMouse) => {
 			const dx = (e.clientX - initialMouse.x) / props.size.width;
 			const dy = (e.clientY - initialMouse.y) / props.size.height;
 
@@ -540,7 +540,7 @@ function ResizeHandle(props: {
 	return (
 		<div
 			class={cx(
-				"absolute w-3 h-3 bg-blue-9 border border-white rounded-full shadow-sm transition-transform hover:scale-125",
+				"absolute w-3 h-3 bg-blue-9 border border-white rounded-full shadow-xs transition-transform hover:scale-125",
 				props.class,
 			)}
 			onMouseDown={props.onMouseDown}

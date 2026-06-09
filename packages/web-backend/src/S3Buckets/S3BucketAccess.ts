@@ -11,6 +11,11 @@ import { type Cause, Effect, Option, Stream } from "effect";
 
 import { S3BucketClientProvider } from "./S3BucketClientProvider.ts";
 
+const DEFAULT_PRESIGNED_GET_EXPIRES_SECONDS = 3600;
+const DEFAULT_PRESIGNED_PUT_EXPIRES_SECONDS = 3600;
+
+type NodeReadableWebStream = Parameters<typeof Readable.fromWeb>[0];
+
 const wrapS3Promise = <T>(
 	promise: Promise<T> | Effect.Effect<Promise<T>, Cause.UnknownException>,
 ): Effect.Effect<T, S3Error, never> =>
@@ -39,26 +44,36 @@ export const createS3BucketAccess = Effect.gen(function* () {
 	return {
 		bucketName: provider.bucket,
 		isPathStyle: provider.isPathStyle,
-		getSignedObjectUrl: (key: string) =>
+		getSignedObjectUrl: (
+			key: string,
+			signingArgs?: RequestPresigningArguments,
+		) =>
 			wrapS3Promise(
 				provider.getPublic.pipe(
 					Effect.map((client) =>
 						S3Presigner.getSignedUrl(
 							client,
 							new S3.GetObjectCommand({ Bucket: provider.bucket, Key: key }),
-							{ expiresIn: 3600 },
+							signingArgs ?? {
+								expiresIn: DEFAULT_PRESIGNED_GET_EXPIRES_SECONDS,
+							},
 						),
 					),
 				),
 			).pipe(Effect.withSpan("getSignedObjectUrl")),
-		getInternalSignedObjectUrl: (key: string) =>
+		getInternalSignedObjectUrl: (
+			key: string,
+			signingArgs?: RequestPresigningArguments,
+		) =>
 			wrapS3Promise(
 				provider.getInternal.pipe(
 					Effect.map((client) =>
 						S3Presigner.getSignedUrl(
 							client,
 							new S3.GetObjectCommand({ Bucket: provider.bucket, Key: key }),
-							{ expiresIn: 3600 },
+							signingArgs ?? {
+								expiresIn: DEFAULT_PRESIGNED_GET_EXPIRES_SECONDS,
+							},
 						),
 					),
 				),
@@ -86,7 +101,11 @@ export const createS3BucketAccess = Effect.gen(function* () {
 					}),
 				),
 			),
-		listObjects: (config: { prefix?: string; maxKeys?: number }) =>
+		listObjects: (config: {
+			prefix?: string;
+			maxKeys?: number;
+			continuationToken?: string;
+		}) =>
 			wrapS3Promise(
 				provider.getInternal.pipe(
 					Effect.map((client) =>
@@ -95,6 +114,7 @@ export const createS3BucketAccess = Effect.gen(function* () {
 								Bucket: provider.bucket,
 								Prefix: config?.prefix,
 								MaxKeys: config?.maxKeys,
+								ContinuationToken: config?.continuationToken,
 							}),
 						),
 					),
@@ -128,7 +148,8 @@ export const createS3BucketAccess = Effect.gen(function* () {
 							} else {
 								_body = body.pipe(
 									Stream.toReadableStreamRuntime(yield* Effect.runtime()),
-									(s) => Readable.fromWeb(s as any),
+									(s) =>
+										Readable.fromWeb(s as unknown as NodeReadableWebStream),
 								);
 							}
 
@@ -210,7 +231,9 @@ export const createS3BucketAccess = Effect.gen(function* () {
 								Key: key,
 								...args,
 							}),
-							signingArgs,
+							signingArgs ?? {
+								expiresIn: DEFAULT_PRESIGNED_PUT_EXPIRES_SECONDS,
+							},
 						),
 					),
 				),
@@ -230,7 +253,9 @@ export const createS3BucketAccess = Effect.gen(function* () {
 								Key: key,
 								...args,
 							}),
-							signingArgs,
+							signingArgs ?? {
+								expiresIn: DEFAULT_PRESIGNED_PUT_EXPIRES_SECONDS,
+							},
 						),
 					),
 				),

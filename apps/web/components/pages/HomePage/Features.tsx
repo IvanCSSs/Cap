@@ -1,3 +1,5 @@
+"use client";
+
 import { Button } from "@cap/ui";
 import { Fit, Layout, useRive } from "@rive-app/react-canvas";
 import clsx from "clsx";
@@ -140,7 +142,7 @@ const features: Feature[] = homepageCopy.features.features.map(
 		return {
 			title: feature.title,
 			description: feature.description,
-			rive: riveComponents[index] || <div key={`placeholder-${index}`} />,
+			rive: riveComponents[index] ?? <div />,
 			relative: relatives[index],
 		};
 	},
@@ -156,7 +158,6 @@ const Features = () => {
 				{homepageCopy.features.subtitle}
 			</p>
 			<div className="flex flex-col gap-4 mt-[52px]">
-				{/* Second row - 2 features */}
 				<div className="grid grid-cols-1 gap-4 mx-auto w-full md:grid-cols-2">
 					{features.slice(3, 5).map((feature) => (
 						<FeatureCard
@@ -165,13 +166,11 @@ const Features = () => {
 							className="flex-1 min-w-full"
 							description={feature.description}
 							rive={feature.rive}
-							imageAlt={feature.title}
 							relative={feature.relative}
 						/>
 					))}
 				</div>
 
-				{/* First row - 3 features */}
 				<div className="grid grid-cols-1 gap-4 md:grid-cols-3">
 					{features.slice(0, 3).map((feature) => (
 						<FeatureCard
@@ -179,13 +178,11 @@ const Features = () => {
 							title={feature.title}
 							description={feature.description}
 							rive={feature.rive}
-							imageAlt={feature.title}
 							relative={feature.relative}
 						/>
 					))}
 				</div>
 
-				{/* Third row - 2 features */}
 				<div className="grid grid-cols-1 gap-4 mx-auto w-full md:grid-cols-2">
 					{features.slice(5, 7).map((feature) => (
 						<FeatureCard
@@ -193,7 +190,6 @@ const Features = () => {
 							title={feature.title}
 							description={feature.description}
 							rive={feature.rive}
-							imageAlt={feature.title}
 							relative={feature.relative}
 						/>
 					))}
@@ -201,7 +197,6 @@ const Features = () => {
 			</div>
 
 			<div className="mt-10">
-				{/* View all features button */}
 				<Button
 					href="/features"
 					variant="dark"
@@ -225,10 +220,7 @@ const FeatureCard = ({
 	title: string;
 	description: string;
 	rive?: JSX.Element;
-	img?: string;
 	className?: string;
-	imageAlt: string;
-	imageClass?: string;
 	relative?: {
 		top?: number;
 		bottom?: number;

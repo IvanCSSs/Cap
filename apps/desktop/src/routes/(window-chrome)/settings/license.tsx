@@ -23,7 +23,7 @@ export default function Page() {
 	const queryClient = useQueryClient();
 
 	return (
-		<div class="flex relative flex-col gap-3 items-center p-4 mx-auto h-full custom-scroll">
+		<div class="cap-settings-page flex relative flex-col gap-3 items-center p-4 mx-auto h-full custom-scroll">
 			<Switch fallback={<CommercialLicensePurchase />}>
 				<Match when={license.data?.type === "pro" && license.data}>
 					<div class="flex justify-center items-center w-full h-screen">
@@ -108,13 +108,15 @@ function LicenseKeyActivate(props: {
 			<Show when={store()}>
 				{(generalSettings) => {
 					const [licenseKey, setLicenseKey] = createSignal("");
+					const instanceId = generalSettings().instanceId;
+					if (!instanceId) throw new Error("No instance ID found");
 
 					const activateLicenseKey = createMutation(() => ({
 						mutationFn: async (vars: { licenseKey: string }) => {
 							const resp = await licenseApiClient.activateCommercialLicense({
 								headers: {
 									licensekey: vars.licenseKey,
-									instanceid: generalSettings().instanceId!,
+									instanceid: instanceId,
 								},
 								body: { reset: false },
 							});
@@ -126,7 +128,7 @@ function LicenseKeyActivate(props: {
 								"message" in resp.body
 							)
 								throw resp.body.message;
-							throw new Error((resp.body as any).toString());
+							throw new Error(String(resp.body));
 						},
 						onSuccess: (value, { licenseKey }) => {
 							props.onActivated({ ...value, licenseKey });
@@ -204,7 +206,7 @@ function CommercialLicensePurchase() {
 
 	return (
 		<>
-			<div class="w-full max-w-[700px] rounded-xl shadow-sm bg-gray-2">
+			<div class="w-full max-w-[700px] rounded-xl shadow-xs bg-gray-2">
 				<div class="flex flex-col md:flex-row">
 					{/* Left Column */}
 					<div
@@ -233,7 +235,7 @@ function CommercialLicensePurchase() {
 							<h3 class="text-2xl font-medium tracking-tight leading-5">
 								Commercial License
 							</h3>
-							<p class="mt-2 text-sm text-[--text-tertiary]">
+							<p class="mt-2 text-sm text-(--text-tertiary)">
 								For commercial use
 							</p>
 						</div>
@@ -261,7 +263,7 @@ function CommercialLicensePurchase() {
 							onClick={() => openCommercialCheckout.mutate()}
 							disabled={openCommercialCheckout.isPending}
 							variant="dark"
-							class="w-full !rounded-full mt-10 !h-[48px] text-lg font-medium"
+							class="w-full rounded-full! mt-10 h-[48px]! text-lg font-medium"
 							size="lg"
 						>
 							{openCommercialCheckout.isPending
@@ -281,9 +283,9 @@ function CommercialLicensePurchase() {
 							].map((feature) => (
 								<li class="flex justify-start items-center">
 									<div class="flex justify-center items-center p-0 m-0 w-6 h-6">
-										<IconLucideCheck class="w-4 h-4 text-[--text-primary]" />
+										<IconLucideCheck class="w-4 h-4 text-(--text-primary)" />
 									</div>
-									<span class="ml-1 text-[0.9rem] text-[--text-primary]">
+									<span class="ml-1 text-[0.9rem] text-(--text-primary)">
 										{feature}
 									</span>
 								</li>

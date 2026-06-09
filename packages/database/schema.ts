@@ -1,10 +1,12 @@
 import type {
+	AiGenerationLanguage,
 	Comment,
 	Folder,
 	ImageUpload,
 	Organisation,
 	S3Bucket,
 	Space,
+	Storage,
 	User,
 	Video,
 } from "@cap/web-domain";
@@ -30,7 +32,15 @@ import {
 import { relations } from "drizzle-orm/relations";
 
 import { nanoIdLength } from "./helpers.ts";
-import type { VideoMetadata } from "./types/index.ts";
+import type { VideoEditSpec, VideoMetadata } from "./types/index.ts";
+
+type GoogleDriveStorageQuotaCache = {
+	limit?: string | null;
+	usage?: string | null;
+	usageInDrive?: string | null;
+	usageInDriveTrash?: string | null;
+	fetchedAt: string;
+};
 
 const nanoId = customType<{ data: string; notNull: true }>({
 	dataType() {
@@ -113,6 +123,7 @@ export const users = mysqlTable(
 		inviteQuota: int("inviteQuota").notNull().default(1),
 		defaultOrgId:
 			nanoIdNullable("defaultOrgId").$type<Organisation.OrganisationId>(),
+		authSessionVersion: int("authSessionVersion").notNull().default(0),
 	},
 	(table) => ({
 		emailIndex: uniqueIndex("email_idx").on(table.email),
@@ -191,8 +202,15 @@ export const organizations = mysqlTable(
 			disableReactions?: boolean;
 			disableTranscript?: boolean;
 			disableComments?: boolean;
+			hideShareableLinkCapLogo?: boolean;
+			shareableLinkUseOrganizationIcon?: boolean;
+			aiGenerationLanguage?: AiGenerationLanguage;
+			defaultPlaybackSpeed?: number;
 		}>(),
 		iconUrl: varchar("iconUrl", {
+			length: 1024,
+		}).$type<ImageUpload.ImageUrlOrKey>(),
+		shareableLinkIconUrl: varchar("shareableLinkIconUrl", {
 			length: 1024,
 		}).$type<ImageUpload.ImageUrlOrKey>(),
 		createdAt: timestamp("createdAt").notNull().defaultNow(),
@@ -209,7 +227,7 @@ export const organizations = mysqlTable(
 	}),
 );
 
-export type OrganisationMemberRole = "owner" | "member";
+export type OrganisationMemberRole = "owner" | "admin" | "member";
 export const organizationMembers = mysqlTable(
 	"organization_members",
 	{
@@ -297,6 +315,9 @@ export const videos = mysqlTable(
 		orgId: nanoIdRequired("orgId").$type<Organisation.OrganisationId>(),
 		name: varchar("name", { length: 255 }).notNull().default("My Video"),
 		bucket: nanoIdNullable("bucket").$type<S3Bucket.S3BucketId>(),
+		storageIntegrationId: nanoIdNullable("storageIntegrationId")
+			.references(() => storageIntegrations.id, { onDelete: "restrict" })
+			.$type<Storage.StorageIntegrationId>(),
 		// in seconds
 		duration: float("duration"),
 		width: int("width"),
@@ -311,6 +332,7 @@ export const videos = mysqlTable(
 			disableReactions?: boolean;
 			disableTranscript?: boolean;
 			disableComments?: boolean;
+			defaultPlaybackSpeed?: number;
 		}>(),
 		transcriptionStatus: varchar("transcriptionStatus", { length: 255 }).$type<
 			"PROCESSING" | "COMPLETE" | "ERROR" | "SKIPPED" | "NO_AUDIO"
@@ -320,6 +342,7 @@ export const videos = mysqlTable(
 				| { type: "MediaConvert" }
 				| { type: "local" }
 				| { type: "desktopMP4" }
+				| { type: "desktopSegments" }
 				| { type: "webMP4" }
 			>()
 			.notNull()
@@ -352,6 +375,7 @@ export const videos = mysqlTable(
 		index("owner_id_idx").on(table.ownerId),
 		index("is_public_idx").on(table.public),
 		index("folder_id_idx").on(table.folderId),
+		index("storage_integration_id_idx").on(table.storageIntegrationId),
 		index("org_owner_folder_idx").on(
 			table.orgId,
 			table.ownerId,
@@ -363,6 +387,18 @@ export const videos = mysqlTable(
 		),
 	],
 );
+
+export const videoEdits = mysqlTable("video_edits", {
+	videoId: nanoId("videoId")
+		.notNull()
+		.primaryKey()
+		.$type<Video.VideoId>()
+		.references(() => videos.id, { onDelete: "cascade" }),
+	sourceKey: varchar("sourceKey", { length: 512 }).notNull(),
+	editSpec: json("editSpec").notNull().$type<VideoEditSpec>(),
+	createdAt: timestamp("createdAt").notNull().defaultNow(),
+	updatedAt: timestamp("updatedAt").notNull().defaultNow().onUpdateNow(),
+});
 
 export const sharedVideos = mysqlTable(
 	"shared_videos",
@@ -550,17 +586,128 @@ export const messengerMessages = mysqlTable(
 	}),
 );
 
-export const s3Buckets = mysqlTable("s3_buckets", {
-	id: nanoId("id").notNull().primaryKey().$type<S3Bucket.S3BucketId>(),
-	ownerId: nanoId("ownerId").notNull().$type<User.UserId>(),
-	// Use encryptedText for sensitive fields
-	region: encryptedText("region").notNull(),
-	endpoint: encryptedTextNullable("endpoint"),
-	bucketName: encryptedText("bucketName").notNull(),
-	accessKeyId: encryptedText("accessKeyId").notNull(),
-	secretAccessKey: encryptedText("secretAccessKey").notNull(),
-	provider: text("provider").notNull().default("aws"),
-});
+export const s3Buckets = mysqlTable(
+	"s3_buckets",
+	{
+		id: nanoId("id").notNull().primaryKey().$type<S3Bucket.S3BucketId>(),
+		ownerId: nanoId("ownerId").notNull().$type<User.UserId>(),
+		organizationId:
+			nanoIdNullable("organizationId").$type<Organisation.OrganisationId>(),
+		region: encryptedText("region").notNull(),
+		endpoint: encryptedTextNullable("endpoint"),
+		bucketName: encryptedText("bucketName").notNull(),
+		accessKeyId: encryptedText("accessKeyId").notNull(),
+		secretAccessKey: encryptedText("secretAccessKey").notNull(),
+		provider: text("provider").notNull().default("aws"),
+		active: boolean("active").notNull().default(true),
+		createdAt: timestamp("createdAt").notNull().defaultNow(),
+		updatedAt: timestamp("updatedAt").notNull().defaultNow().onUpdateNow(),
+	},
+	(table) => ({
+		ownerOrganizationIndex: index("owner_organization_idx").on(
+			table.ownerId,
+			table.organizationId,
+		),
+		organizationIdIndex: index("organization_id_idx").on(table.organizationId),
+		organizationActiveIndex: index("organization_active_idx").on(
+			table.organizationId,
+			table.active,
+			table.updatedAt,
+		),
+	}),
+);
+
+export const storageIntegrations = mysqlTable(
+	"storage_integrations",
+	{
+		id: nanoId("id")
+			.notNull()
+			.primaryKey()
+			.$type<Storage.StorageIntegrationId>(),
+		ownerId: nanoId("ownerId").notNull().$type<User.UserId>(),
+		organizationId:
+			nanoIdNullable("organizationId").$type<Organisation.OrganisationId>(),
+		provider: varchar("provider", { length: 64 })
+			.notNull()
+			.$type<Storage.StorageProvider>(),
+		displayName: varchar("displayName", { length: 255 }).notNull(),
+		status: varchar("status", { length: 32 })
+			.notNull()
+			.default("active")
+			.$type<Storage.StorageIntegrationStatus>(),
+		active: boolean("active").notNull().default(false),
+		encryptedConfig: encryptedText("encryptedConfig").notNull(),
+		googleDriveAccessToken: encryptedTextNullable("googleDriveAccessToken"),
+		googleDriveAccessTokenExpiresAt: timestamp(
+			"googleDriveAccessTokenExpiresAt",
+		),
+		googleDriveTokenRefreshLeaseId: varchar("googleDriveTokenRefreshLeaseId", {
+			length: 64,
+		}),
+		googleDriveTokenRefreshLeaseExpiresAt: timestamp(
+			"googleDriveTokenRefreshLeaseExpiresAt",
+		),
+		googleDriveStorageQuotaCache: json(
+			"googleDriveStorageQuotaCache",
+		).$type<GoogleDriveStorageQuotaCache>(),
+		createdAt: timestamp("createdAt").notNull().defaultNow(),
+		updatedAt: timestamp("updatedAt").notNull().defaultNow().onUpdateNow(),
+	},
+	(table) => ({
+		ownerProviderIndex: index("owner_provider_idx").on(
+			table.ownerId,
+			table.provider,
+		),
+		ownerActiveIndex: index("owner_active_idx").on(table.ownerId, table.active),
+		organizationProviderIndex: index("organization_provider_idx").on(
+			table.organizationId,
+			table.provider,
+		),
+		organizationActiveIndex: index("organization_active_idx").on(
+			table.organizationId,
+			table.active,
+			table.status,
+		),
+	}),
+);
+
+export const storageObjects = mysqlTable(
+	"storage_objects",
+	{
+		id: nanoId("id").notNull().primaryKey().$type<Storage.StorageObjectId>(),
+		integrationId: nanoId("integrationId")
+			.notNull()
+			.references(() => storageIntegrations.id, { onDelete: "restrict" })
+			.$type<Storage.StorageIntegrationId>(),
+		ownerId: nanoId("ownerId").notNull().$type<User.UserId>(),
+		videoId: nanoIdNullable("videoId").$type<Video.VideoId>(),
+		objectKey: text("objectKey").notNull(),
+		objectKeyHash: varchar("objectKeyHash", { length: 64 }).notNull(),
+		providerObjectId: varchar("providerObjectId", { length: 255 }).notNull(),
+		uploadSessionUrl: encryptedTextNullable("uploadSessionUrl"),
+		uploadStatus: varchar("uploadStatus", { length: 32 })
+			.notNull()
+			.default("pending")
+			.$type<"pending" | "complete" | "error">(),
+		contentType: varchar("contentType", { length: 255 }),
+		contentLength: bigint("contentLength", { mode: "number", unsigned: true }),
+		metadata: json("metadata").$type<Storage.StorageObjectMetadata>(),
+		createdAt: timestamp("createdAt").notNull().defaultNow(),
+		updatedAt: timestamp("updatedAt").notNull().defaultNow().onUpdateNow(),
+	},
+	(table) => ({
+		integrationKeyHashIndex: uniqueIndex("integration_key_hash_idx").on(
+			table.integrationId,
+			table.objectKeyHash,
+		),
+		integrationStatusIndex: index("integration_status_idx").on(
+			table.integrationId,
+			table.uploadStatus,
+		),
+		videoIdIndex: index("video_id_idx").on(table.videoId),
+		ownerIdIndex: index("owner_id_idx").on(table.ownerId),
+	}),
+);
 
 export const notificationsRelations = relations(notifications, ({ one }) => ({
 	org: one(organizations, {
@@ -627,6 +774,7 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	videos: many(videos),
 	sharedVideos: many(sharedVideos),
 	customBucket: one(s3Buckets),
+	storageIntegrations: many(storageIntegrations),
 	spaces: many(spaces),
 	spaceMembers: many(spaceMembers),
 	messengerConversations: many(messengerConversations),
@@ -645,6 +793,36 @@ export const s3BucketsRelations = relations(s3Buckets, ({ one }) => ({
 		fields: [s3Buckets.ownerId],
 		references: [users.id],
 	}),
+	organization: one(organizations, {
+		fields: [s3Buckets.organizationId],
+		references: [organizations.id],
+	}),
+}));
+
+export const storageIntegrationsRelations = relations(
+	storageIntegrations,
+	({ one, many }) => ({
+		owner: one(users, {
+			fields: [storageIntegrations.ownerId],
+			references: [users.id],
+		}),
+		organization: one(organizations, {
+			fields: [storageIntegrations.organizationId],
+			references: [organizations.id],
+		}),
+		objects: many(storageObjects),
+	}),
+);
+
+export const storageObjectsRelations = relations(storageObjects, ({ one }) => ({
+	integration: one(storageIntegrations, {
+		fields: [storageObjects.integrationId],
+		references: [storageIntegrations.id],
+	}),
+	video: one(videos, {
+		fields: [storageObjects.videoId],
+		references: [videos.id],
+	}),
 }));
 
 export const organizationsRelations = relations(
@@ -658,6 +836,8 @@ export const organizationsRelations = relations(
 		sharedVideos: many(sharedVideos),
 		organizationInvites: many(organizationInvites),
 		spaces: many(spaces),
+		s3Buckets: many(s3Buckets),
+		storageIntegrations: many(storageIntegrations),
 	}),
 );
 
@@ -710,9 +890,24 @@ export const videosRelations = relations(videos, ({ one, many }) => ({
 	}),
 	sharedVideos: many(sharedVideos),
 	spaceVideos: many(spaceVideos),
+	edit: one(videoEdits, {
+		fields: [videos.id],
+		references: [videoEdits.videoId],
+	}),
 	folder: one(folders, {
 		fields: [videos.folderId],
 		references: [folders.id],
+	}),
+	storageIntegration: one(storageIntegrations, {
+		fields: [videos.storageIntegrationId],
+		references: [storageIntegrations.id],
+	}),
+}));
+
+export const videoEditsRelations = relations(videoEdits, ({ one }) => ({
+	video: one(videos, {
+		fields: [videoEdits.videoId],
+		references: [videos.id],
 	}),
 }));
 
@@ -748,6 +943,15 @@ export const spaces = mysqlTable(
 			length: 255,
 		}).$type<ImageUpload.ImageUrlOrKey>(),
 		description: varchar("description", { length: 1000 }),
+		settings: json("settings").$type<{
+			disableSummary?: boolean;
+			disableCaptions?: boolean;
+			disableChapters?: boolean;
+			disableReactions?: boolean;
+			disableTranscript?: boolean;
+			disableComments?: boolean;
+		}>(),
+		password: encryptedTextNullable("password"),
 		createdAt: timestamp("createdAt").notNull().defaultNow(),
 		updatedAt: timestamp("updatedAt").notNull().defaultNow().onUpdateNow(),
 		privacy: varchar("privacy", { length: 255, enum: ["Public", "Private"] })
@@ -769,7 +973,7 @@ export const spaceMembers = mysqlTable(
 		role: varchar("role", { length: 255 })
 			.notNull()
 			.default("member")
-			.$type<"member" | "Admin">(),
+			.$type<"admin" | "member">(),
 		createdAt: timestamp("createdAt").notNull().defaultNow(),
 		updatedAt: timestamp("updatedAt").notNull().defaultNow().onUpdateNow(),
 	},
@@ -864,28 +1068,42 @@ export const foldersRelations = relations(folders, ({ one, many }) => ({
 	videos: many(videos),
 }));
 
-export const videoUploads = mysqlTable("video_uploads", {
-	videoId: nanoId("video_id").primaryKey().notNull().$type<Video.VideoId>(),
-	uploaded: bigint("uploaded", { mode: "number", unsigned: true })
-		.notNull()
-		.$defaultFn(() => 0),
-	total: bigint("total", { mode: "number", unsigned: true })
-		.notNull()
-		.$defaultFn(() => 0),
-	startedAt: timestamp("started_at").notNull().defaultNow(),
-	updatedAt: timestamp("updated_at").notNull().defaultNow(),
-	mode: varchar("mode", { length: 255, enum: ["singlepart", "multipart"] }),
-	phase: varchar("phase", { length: 32 })
-		.$type<
-			"uploading" | "processing" | "generating_thumbnail" | "complete" | "error"
-		>()
-		.notNull()
-		.default("uploading"),
-	processingProgress: int("processing_progress").notNull().default(0),
-	processingMessage: varchar("processing_message", { length: 255 }),
-	processingError: text("processing_error"),
-	rawFileKey: varchar("raw_file_key", { length: 512 }),
-});
+export const videoUploads = mysqlTable(
+	"video_uploads",
+	{
+		videoId: nanoId("video_id").primaryKey().notNull().$type<Video.VideoId>(),
+		uploaded: bigint("uploaded", { mode: "number", unsigned: true })
+			.notNull()
+			.$defaultFn(() => 0),
+		total: bigint("total", { mode: "number", unsigned: true })
+			.notNull()
+			.$defaultFn(() => 0),
+		startedAt: timestamp("started_at").notNull().defaultNow(),
+		updatedAt: timestamp("updated_at").notNull().defaultNow(),
+		mode: varchar("mode", { length: 255, enum: ["singlepart", "multipart"] }),
+		phase: varchar("phase", { length: 32 })
+			.$type<
+				| "uploading"
+				| "processing"
+				| "generating_thumbnail"
+				| "complete"
+				| "error"
+			>()
+			.notNull()
+			.default("uploading"),
+		processingProgress: int("processing_progress").notNull().default(0),
+		processingMessage: varchar("processing_message", { length: 255 }),
+		processingError: text("processing_error"),
+		rawFileKey: varchar("raw_file_key", { length: 512 }),
+	},
+	(table) => [
+		index("phase_updated_at_video_id_idx").on(
+			table.phase,
+			table.updatedAt,
+			table.videoId,
+		),
+	],
+);
 
 export const importedVideos = mysqlTable(
 	"imported_videos",

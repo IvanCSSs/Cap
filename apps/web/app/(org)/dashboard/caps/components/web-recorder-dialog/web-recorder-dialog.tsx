@@ -134,6 +134,7 @@ export const WebRecorderDialog = () => {
 		hasAudioTrack,
 		chunkUploads,
 		errorDownload,
+		completedShareUrl,
 		recoveredDownloads,
 		isRecording,
 		isBusy,
@@ -148,6 +149,7 @@ export const WebRecorderDialog = () => {
 		pauseRecording,
 		resumeRecording,
 		stopRecording,
+		openCompletedShareUrl,
 		restartRecording,
 		resetState,
 		dismissRecoveredDownload,
@@ -341,6 +343,22 @@ export const WebRecorderDialog = () => {
 										{unsupportedReason}
 									</div>
 								)}
+								{phase === "completed" && completedShareUrl && (
+									<div className="rounded-md border border-green-6 bg-green-3/70 px-3 py-3 text-xs text-green-12">
+										<div className="font-medium">Share link ready</div>
+										<div className="mt-1 leading-snug">
+											If it did not open automatically, open it here.
+										</div>
+										<Button
+											variant="blue"
+											size="sm"
+											className="mt-3 w-full"
+											onClick={openCompletedShareUrl}
+										>
+											Open Share Link
+										</Button>
+									</div>
+								)}
 								{phase === "idle" && recoveredDownloads.length > 0 && (
 									<div className="rounded-md border border-blue-6 bg-blue-3/60 px-3 py-2">
 										<div className="text-xs font-medium text-blue-12">
@@ -367,6 +385,12 @@ export const WebRecorderDialog = () => {
 															href={download.url}
 															download={download.fileName}
 															className="font-medium text-blue-11 hover:text-blue-12"
+															onClick={() =>
+																setTimeout(
+																	() => dismissRecoveredDownload(download.id),
+																	500,
+																)
+															}
 														>
 															Download
 														</a>

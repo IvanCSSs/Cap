@@ -6,17 +6,19 @@ import {
 import type { VideoId } from "@/app/(org)/dashboard/caps/components/web-recorder-dialog/web-recorder-types";
 
 const STREAMED_PART_BYTES = 5 * 1024 * 1024 + 128;
+const DRIVE_PART_BYTES = 16 * 1024 * 1024;
 const OVERFLOW_PART_BYTES = 129 * 1024 * 1024;
 const FINALIZED_BLOB_BYTES = 129 * 1024 * 1024;
 
 type UploadOutcome =
-	| { type: "success"; etag: string }
+	| { type: "success"; etag?: string; status?: number }
 	| { type: "network-error" }
 	| { type: "pending" };
 
 class MockXMLHttpRequest {
 	static outcomes: UploadOutcome[] = [];
 	static abortedCount = 0;
+	static recordedHeaders: Array<Map<string, string>> = [];
 
 	upload = {
 		onprogress: null as ((event: ProgressEvent<EventTarget>) => void) | null,
@@ -34,6 +36,7 @@ class MockXMLHttpRequest {
 	static setOutcomes(outcomes: UploadOutcome[]) {
 		MockXMLHttpRequest.outcomes = [...outcomes];
 		MockXMLHttpRequest.abortedCount = 0;
+		MockXMLHttpRequest.recordedHeaders = [];
 	}
 
 	open() {}
@@ -47,6 +50,8 @@ class MockXMLHttpRequest {
 	}
 
 	send(part: Blob) {
+		MockXMLHttpRequest.recordedHeaders.push(new Map(this.headers));
+
 		const outcome = MockXMLHttpRequest.outcomes.shift();
 		if (!outcome) {
 			throw new Error("Missing upload outcome");
@@ -69,9 +74,9 @@ class MockXMLHttpRequest {
 		}
 
 		this.completed = true;
-		this.status = 200;
-		this.statusText = "OK";
-		this.headers.set("etag", `"${outcome.etag}"`);
+		this.status = outcome.status ?? 200;
+		this.statusText = this.status === 308 ? "Resume Incomplete" : "OK";
+		if (outcome.etag) this.headers.set("etag", `"${outcome.etag}"`);
 		this.onload?.();
 	}
 
@@ -191,6 +196,185 @@ describe("InstantRecordingUploader", () => {
 				status: "complete",
 			}),
 		]);
+		expect(MockXMLHttpRequest.recordedHeaders[0]?.has("content-type")).toBe(
+			false,
+		);
+	});
+
+	it("normalizes multipart initiate content type before creating the upload", async () => {
+		const fetchMock = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = input.toString();
+				const body = init?.body ? JSON.parse(init.body as string) : null;
+
+				if (url === "/api/upload/multipart/initiate") {
+					expect(body).toMatchObject({
+						videoId,
+						contentType: "video/webm",
+						subpath: "raw-upload.webm",
+					});
+					return makeJsonResponse({ uploadId: "upload-123" });
+				}
+
+				throw new Error(`Unexpected fetch call: ${url}`);
+			},
+		);
+
+		vi.stubGlobal("fetch", fetchMock);
+
+		const { initiateMultipartUpload } = await import(
+			"@/app/(org)/dashboard/caps/components/web-recorder-dialog/instant-mp4-uploader"
+		);
+
+		await expect(
+			initiateMultipartUpload({
+				videoId,
+				contentType: "video/webm;codecs=vp9,opus",
+				subpath: "raw-upload.webm",
+			}),
+		).resolves.toEqual({ uploadId: "upload-123", provider: "s3" });
+	});
+
+	it("uses aligned sequential resumable parts for Google Drive uploads", async () => {
+		const totalBytes = DRIVE_PART_BYTES + 4 * 1024 * 1024;
+		const fetchMock = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = input.toString();
+				const body = init?.body ? JSON.parse(init.body as string) : null;
+
+				if (url === "/api/upload/multipart/presign-part") {
+					return makeJsonResponse({
+						presignedUrl: `https://www.googleapis.com/upload/drive/v3/files/session-${body.partNumber}`,
+						provider: "googleDrive",
+					});
+				}
+
+				if (url === "/api/upload/multipart/complete") {
+					expect(body.parts).toEqual([
+						expect.objectContaining({
+							partNumber: 1,
+							etag: "drive-1",
+							size: DRIVE_PART_BYTES,
+						}),
+						expect.objectContaining({
+							partNumber: 2,
+							etag: "drive-2",
+							size: 4 * 1024 * 1024,
+						}),
+					]);
+					return makeJsonResponse({ success: true });
+				}
+
+				throw new Error(`Unexpected fetch call: ${url}`);
+			},
+		);
+
+		vi.stubGlobal("fetch", fetchMock);
+		MockXMLHttpRequest.setOutcomes([
+			{ type: "success", status: 308 },
+			{ type: "success", status: 200 },
+		]);
+
+		const uploader = new InstantRecordingUploader({
+			videoId,
+			uploadId: "drive-session",
+			provider: "googleDrive",
+			mimeType: "video/webm",
+			subpath: "raw-upload.webm",
+			setUploadStatus: vi.fn(),
+			sendProgressUpdate: vi.fn().mockResolvedValue(undefined),
+		});
+
+		uploader.handleChunk(
+			makeBlob(10 * 1024 * 1024, "video/webm"),
+			10 * 1024 * 1024,
+		);
+		uploader.handleChunk(makeBlob(10 * 1024 * 1024, "video/webm"), totalBytes);
+
+		await uploader.finalize({
+			finalBlob: makeBlob(totalBytes, "video/webm"),
+			durationSeconds: 20,
+			subpath: "raw-upload.webm",
+		});
+
+		expect(MockXMLHttpRequest.recordedHeaders[0]?.get("content-range")).toBe(
+			`bytes 0-${DRIVE_PART_BYTES - 1}/*`,
+		);
+		expect(MockXMLHttpRequest.recordedHeaders[1]?.get("content-range")).toBe(
+			`bytes ${DRIVE_PART_BYTES}-${totalBytes - 1}/${totalBytes}`,
+		);
+		expect(MockXMLHttpRequest.recordedHeaders[0]?.get("content-type")).toBe(
+			"video/webm",
+		);
+	});
+
+	it("finalizes Google Drive streamed chunks with a concrete total byte count", async () => {
+		const totalBytes = DRIVE_PART_BYTES + 4 * 1024 * 1024;
+		const fetchMock = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = input.toString();
+				const body = init?.body ? JSON.parse(init.body as string) : null;
+
+				if (url === "/api/upload/multipart/presign-part") {
+					return makeJsonResponse({
+						presignedUrl: `https://www.googleapis.com/upload/drive/v3/files/session-${body.partNumber}`,
+						provider: "googleDrive",
+					});
+				}
+
+				if (url === "/api/upload/multipart/complete") {
+					expect(body.parts).toEqual([
+						expect.objectContaining({
+							partNumber: 1,
+							etag: "drive-1",
+							size: DRIVE_PART_BYTES,
+						}),
+						expect.objectContaining({
+							partNumber: 2,
+							etag: "drive-2",
+							size: 4 * 1024 * 1024,
+						}),
+					]);
+					return makeJsonResponse({ success: true });
+				}
+
+				throw new Error(`Unexpected fetch call: ${url}`);
+			},
+		);
+
+		vi.stubGlobal("fetch", fetchMock);
+		MockXMLHttpRequest.setOutcomes([
+			{ type: "success", status: 308 },
+			{ type: "success", status: 200 },
+		]);
+
+		const uploader = new InstantRecordingUploader({
+			videoId,
+			uploadId: "drive-session",
+			provider: "googleDrive",
+			mimeType: "video/webm",
+			subpath: "raw-upload.webm",
+			setUploadStatus: vi.fn(),
+			sendProgressUpdate: vi.fn().mockResolvedValue(undefined),
+		});
+
+		uploader.handleChunk(
+			makeBlob(10 * 1024 * 1024, "video/webm"),
+			10 * 1024 * 1024,
+		);
+		uploader.handleChunk(makeBlob(10 * 1024 * 1024, "video/webm"), totalBytes);
+
+		await uploader.finalize({
+			durationSeconds: 20,
+			subpath: "raw-upload.webm",
+		});
+
+		expect(MockXMLHttpRequest.recordedHeaders[0]?.get("content-range")).toBe(
+			`bytes 0-${DRIVE_PART_BYTES - 1}/*`,
+		);
+		expect(MockXMLHttpRequest.recordedHeaders[1]?.get("content-range")).toBe(
+			`bytes ${DRIVE_PART_BYTES}-${totalBytes - 1}/${totalBytes}`,
+		);
 	});
 
 	it("completes multipart uploads with parts ordered by part number", async () => {
@@ -409,7 +593,7 @@ describe("InstantRecordingUploader", () => {
 		);
 	});
 
-	it("fails finalize when server-side processing cannot start", async () => {
+	it("keeps finalize successful when server-side processing has not started yet", async () => {
 		const fetchMock = vi.fn(
 			async (input: RequestInfo | URL, init?: RequestInit) => {
 				const url = input.toString();
@@ -458,7 +642,8 @@ describe("InstantRecordingUploader", () => {
 				durationSeconds: 12,
 				subpath: "raw-upload.webm",
 			}),
-		).rejects.toThrow("Video uploaded, but processing could not start");
+		).resolves.toBeUndefined();
+		expect(uploader.getProcessingStarted()).toBe(false);
 	});
 
 	it("treats interrupted multipart completion as uncertain instead of fatal cleanup", async () => {

@@ -1,9 +1,11 @@
+import { Button } from "@cap/ui-solid";
 import { createEventListenerMap } from "@solid-primitives/event-listener";
 import { Menu } from "@tauri-apps/api/menu";
 import { cx } from "cva";
 import { Array, Option } from "effect";
 import {
 	batch,
+	createEffect,
 	createMemo,
 	createRoot,
 	createSignal,
@@ -20,13 +22,20 @@ import {
 	useTimelineContext,
 	useTrackContext,
 } from "./context";
-import { SegmentContent, SegmentHandle, SegmentRoot, TrackRoot } from "./Track";
+import {
+	SegmentContent,
+	SegmentHandle,
+	SegmentRoot,
+	TrackRoot,
+	useSetPreviewTime,
+} from "./Track";
 
 export type ZoomSegmentDragState =
 	| { type: "idle" }
 	| { type: "movePending" }
 	| { type: "moving" };
 
+const MIN_ZOOM_SEGMENT_PIXEL_WIDTH = 40;
 const MIN_NEW_SEGMENT_PIXEL_WIDTH = 80;
 const MIN_NEW_SEGMENT_SECS_WIDTH = 1;
 
@@ -42,25 +51,47 @@ export function ZoomTrack(props: {
 		editorState,
 		totalDuration,
 		projectActions,
+		meta,
 	} = useEditorContext();
 
 	const { duration, secsPerPixel } = useTimelineContext();
+	const setPreviewTime = useSetPreviewTime();
 
 	const [creatingSegmentViaDrag, setCreatingSegmentViaDrag] =
 		createSignal(false);
+	const [isGeneratingAutoZoom, setIsGeneratingAutoZoom] = createSignal(false);
+	const [isHoveringGenerateZoomButton, setIsHoveringGenerateZoomButton] =
+		createSignal(false);
+	const [
+		sessionDismissedGenerateZoomPrompt,
+		setSessionDismissedGenerateZoomPrompt,
+	] = createSignal(false);
+
+	const hasZoomSegments = () =>
+		(project.timeline?.zoomSegments?.length ?? 0) > 0;
+	const selectedZoomIndices = createMemo(() => {
+		const selection = editorState.timeline.selection;
+		if (!selection || selection.type !== "zoom") return null;
+		return new Set(selection.indices);
+	});
+
+	const hasRecordedCursorData = () => meta().hasRecordedCursorData;
+
+	createEffect(() => {
+		if (hasZoomSegments() || sessionDismissedGenerateZoomPrompt()) {
+			setIsHoveringGenerateZoomButton(false);
+		}
+	});
 
 	const handleGenerateZoomSegments = async () => {
+		setIsGeneratingAutoZoom(true);
 		try {
 			const zoomSegments = await commands.generateZoomSegmentsFromClicks();
 			setProject("timeline", "zoomSegments", zoomSegments);
-			if (zoomSegments.length > 0) {
-				const currentSize = project.cursor?.size ?? 0;
-				if (currentSize < 200) {
-					setProject("cursor", "size", 200);
-				}
-			}
 		} catch (error) {
 			console.error("Failed to generate zoom segments:", error);
+		} finally {
+			setIsGeneratingAutoZoom(false);
 		}
 	};
 
@@ -195,17 +226,16 @@ export function ZoomTrack(props: {
 										start: baseSegment.start,
 										end: Math.max(minEndTime, endTime),
 										amount: 1.5,
-										mode: {
-											manual: {
-												x: 0.5,
-												y: 0.5,
-											},
-										},
+										mode: "auto",
 									});
 
 									createdSegmentIndex = index;
 								}),
 							);
+							setEditorState("timeline", "selection", {
+								type: "zoom",
+								indices: [createdSegmentIndex],
+							});
 						});
 						segmentCreated = true;
 					};
@@ -267,13 +297,44 @@ export function ZoomTrack(props: {
 			}}
 		>
 			<Show
-				when={project.timeline?.zoomSegments}
+				when={hasZoomSegments()}
 				fallback={
-					<div class="text-center text-sm text-[--text-tertiary] flex flex-col justify-center items-center inset-0 w-full bg-gray-3/20 dark:bg-gray-3/10 hover:bg-gray-3/30 dark:hover:bg-gray-3/20 transition-colors rounded-xl pointer-events-none">
-						<div>Click to add zoom segment</div>
-						<div class="text-[10px] text-[--text-tertiary]/40 mt-0.5">
-							(Smoothly zoom in on important areas)
-						</div>
+					<div class="relative z-1 isolate text-center text-sm text-(--text-tertiary) flex flex-col gap-2 justify-center items-center inset-0 w-full bg-gray-3/20 dark:bg-gray-3/10 hover:bg-gray-3/30 dark:hover:bg-gray-3/20 transition-colors rounded-xl pointer-events-auto px-2 py-1">
+						<Show
+							when={
+								hasRecordedCursorData() && !sessionDismissedGenerateZoomPrompt()
+							}
+						>
+							<div
+								class="relative z-10 flex items-center gap-1"
+								onMouseEnter={() => setIsHoveringGenerateZoomButton(true)}
+								onMouseLeave={() => setIsHoveringGenerateZoomButton(false)}
+								onMouseDown={(e) => e.stopPropagation()}
+							>
+								<Button
+									variant="gray"
+									size="md"
+									class="shadow-md border-gray-7 dark:border-gray-8 font-medium"
+									disabled={isGeneratingAutoZoom()}
+									onClick={() => {
+										void handleGenerateZoomSegments();
+									}}
+								>
+									{isGeneratingAutoZoom()
+										? "Generating..."
+										: "Click to generate zoom segments"}
+								</Button>
+								<button
+									type="button"
+									class="flex shrink-0 justify-center items-center rounded-full outline-hidden text-gray-11 hover:text-gray-12 hover:bg-gray-5 focus-visible:ring-2 focus-visible:ring-gray-8 size-8 transition-colors"
+									disabled={isGeneratingAutoZoom()}
+									aria-label="Dismiss for this session"
+									onClick={() => setSessionDismissedGenerateZoomPrompt(true)}
+								>
+									<IconLucideX class="size-4" />
+								</button>
+							</div>
+						</Show>
 					</div>
 				}
 			>
@@ -287,6 +348,54 @@ export function ZoomTrack(props: {
 						};
 
 						const zoomSegments = () => project.timeline?.zoomSegments ?? [];
+
+						// Double-clicking a handle expands the segment as far as it can go
+						// in that direction (up to the neighbouring segment / timeline edge).
+						const fillStart = () => {
+							const segs = zoomSegments();
+							let minValue = 0;
+							for (let j = segs.length - 1; j >= 0; j--) {
+								const s = segs[j];
+								if (s && s.end <= segment().start) {
+									minValue = s.end;
+									break;
+								}
+							}
+							batch(() => {
+								setProject("timeline", "zoomSegments", i, "start", minValue);
+								setProject(
+									"timeline",
+									"zoomSegments",
+									produce((s) => {
+										s.sort((a, b) => a.start - b.start);
+									}),
+								);
+							});
+							setPreviewTime(minValue);
+						};
+
+						const fillEnd = () => {
+							const segs = zoomSegments();
+							let maxValue = totalDuration();
+							for (let j = 0; j < segs.length; j++) {
+								const s = segs[j];
+								if (s && s.start > segment().end) {
+									maxValue = s.start;
+									break;
+								}
+							}
+							batch(() => {
+								setProject("timeline", "zoomSegments", i, "end", maxValue);
+								setProject(
+									"timeline",
+									"zoomSegments",
+									produce((s) => {
+										s.sort((a, b) => a.start - b.start);
+									}),
+								);
+							});
+							setPreviewTime(maxValue);
+						};
 
 						function createMouseDownDrag<T>(
 							setup: () => T,
@@ -403,24 +512,16 @@ export function ZoomTrack(props: {
 						}
 
 						const isSelected = createMemo(() => {
-							const selection = editorState.timeline.selection;
-							if (!selection || selection.type !== "zoom") return false;
-
-							const segmentIndex = project.timeline?.zoomSegments?.findIndex(
-								(s) => s.start === segment().start && s.end === segment().end,
-							);
-
-							if (segmentIndex === undefined || segmentIndex === -1)
-								return false;
-
-							return selection.indices.includes(segmentIndex);
+							const indices = selectedZoomIndices();
+							if (!indices) return false;
+							return indices.has(i);
 						});
 
 						return (
 							<SegmentRoot
 								class={cx(
 									"border duration-200 hover:border-gray-12 transition-colors group",
-									"bg-gradient-to-r from-[#292929] via-[#434343] to-[#292929] shadow-[inset_0_8px_12px_3px_rgba(255,255,255,0.2)]",
+									"bg-linear-to-r from-[#292929] via-[#434343] to-[#292929] shadow-[inset_0_8px_12px_3px_rgba(255,255,255,0.2)]",
 									isSelected() ? "border-gray-12" : "border-transparent",
 								)}
 								innerClass="ring-red-5"
@@ -441,16 +542,25 @@ export function ZoomTrack(props: {
 							>
 								<SegmentHandle
 									position="start"
+									onDblClick={(e) => {
+										e.stopPropagation();
+										fillStart();
+									}}
 									onMouseDown={createMouseDownDrag(
 										() => {
 											const start = segment().start;
+											const minDuration = Math.max(
+												1,
+												secsPerPixel() * MIN_ZOOM_SEGMENT_PIXEL_WIDTH,
+											);
 
 											let minValue = 0;
 
-											const maxValue = segment().end - 1;
+											const maxValue = segment().end - minDuration;
 
 											for (let i = zoomSegments().length - 1; i >= 0; i--) {
-												const segment = zoomSegments()[i]!;
+												const segment = zoomSegments()[i];
+												if (!segment) continue;
 												if (segment.end <= start) {
 													minValue = segment.end;
 													break;
@@ -463,16 +573,17 @@ export function ZoomTrack(props: {
 											const newStart =
 												value.start +
 												(e.clientX - initialMouseX) * secsPerPixel();
+											const nextStart = Math.min(
+												value.maxValue,
+												Math.max(value.minValue, newStart),
+											);
 
 											setProject(
 												"timeline",
 												"zoomSegments",
 												i,
 												"start",
-												Math.min(
-													value.maxValue,
-													Math.max(value.minValue, newStart),
-												),
+												nextStart,
 											);
 
 											setProject(
@@ -482,6 +593,7 @@ export function ZoomTrack(props: {
 													s.sort((a, b) => a.start - b.start);
 												}),
 											);
+											setPreviewTime(nextStart);
 										},
 									)}
 								/>
@@ -555,16 +667,25 @@ export function ZoomTrack(props: {
 								</SegmentContent>
 								<SegmentHandle
 									position="end"
+									onDblClick={(e) => {
+										e.stopPropagation();
+										fillEnd();
+									}}
 									onMouseDown={createMouseDownDrag(
 										() => {
 											const end = segment().end;
+											const minDuration = Math.max(
+												1,
+												secsPerPixel() * MIN_ZOOM_SEGMENT_PIXEL_WIDTH,
+											);
 
-											const minValue = segment().start + 1;
+											const minValue = segment().start + minDuration;
 
 											let maxValue = duration();
 
 											for (let i = 0; i < zoomSegments().length; i++) {
-												const segment = zoomSegments()[i]!;
+												const segment = zoomSegments()[i];
+												if (!segment) continue;
 												if (segment.start > end) {
 													maxValue = segment.start;
 													break;
@@ -577,17 +698,12 @@ export function ZoomTrack(props: {
 											const newEnd =
 												value.end +
 												(e.clientX - initialMouseX) * secsPerPixel();
-
-											setProject(
-												"timeline",
-												"zoomSegments",
-												i,
-												"end",
-												Math.min(
-													value.maxValue,
-													Math.max(value.minValue, newEnd),
-												),
+											const nextEnd = Math.min(
+												value.maxValue,
+												Math.max(value.minValue, newEnd),
 											);
+
+											setProject("timeline", "zoomSegments", i, "end", nextEnd);
 
 											setProject(
 												"timeline",
@@ -596,6 +712,7 @@ export function ZoomTrack(props: {
 													s.sort((a, b) => a.start - b.start);
 												}),
 											);
+											setPreviewTime(nextEnd);
 										},
 									)}
 								/>
@@ -606,16 +723,18 @@ export function ZoomTrack(props: {
 			</Show>
 			<Show
 				when={
-					!useTrackContext().trackState.draggingSegment && newSegmentDetails()
+					!isHoveringGenerateZoomButton() &&
+					!useTrackContext().trackState.draggingSegment &&
+					newSegmentDetails()
 				}
 			>
 				{(details) => (
 					<SegmentRoot
-						class="pointer-events-none"
+						class="pointer-events-none z-0"
 						innerClass="ring-red-300"
 						segment={details()}
 					>
-						<SegmentContent class="bg-gradient-to-r hover:border duration-200 hover:border-gray-500 from-[#292929] via-[#434343] to-[#292929] transition-colors group shadow-[inset_0_8px_12px_3px_rgba(255,255,255,0.2)]">
+						<SegmentContent class="bg-linear-to-r hover:border duration-200 hover:border-gray-500 from-[#292929] via-[#434343] to-[#292929] transition-colors group shadow-[inset_0_8px_12px_3px_rgba(255,255,255,0.2)]">
 							<p class="w-full text-center text-gray-1 dark:text-gray-12 text-md text-primary">
 								+
 							</p>

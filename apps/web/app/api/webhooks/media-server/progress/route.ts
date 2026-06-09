@@ -4,6 +4,8 @@ import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
+import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota";
+import { isEditSourceKey } from "@/lib/video-edit-processing";
 
 interface ProgressWebhookPayload {
 	jobId: string;
@@ -64,17 +66,21 @@ function mapPhaseToDbPhase(
 export async function POST(request: NextRequest) {
 	try {
 		const webhookSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
-		if (webhookSecret) {
-			const authHeader = request.headers.get("x-media-server-secret");
-			if (authHeader !== webhookSecret) {
-				return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-			}
+		const authHeader = request.headers.get("x-media-server-secret");
+		if (!webhookSecret || authHeader !== webhookSecret) {
+			return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 		}
 
 		const payload: ProgressWebhookPayload = await request.json();
+		const isRetryableWorkflowError =
+			request.nextUrl.searchParams.get("retryable") === "true" &&
+			payload.phase === "error";
 
 		console.log(
-			`[media-server-webhook] Received progress update for video ${payload.videoId}: ${payload.phase} (${payload.progress}%)`,
+			"[media-server-webhook] Received progress update for video %s: %s (%d%%)",
+			payload.videoId,
+			payload.phase,
+			payload.progress,
 		);
 
 		const dbPhase = mapPhaseToDbPhase(payload.phase);
@@ -82,30 +88,85 @@ export async function POST(request: NextRequest) {
 		if (dbPhase === "complete") {
 			if (payload.metadata) {
 				const duration = getValidDuration(payload.metadata.duration);
-
 				await db()
 					.update(videos)
 					.set({
 						width: payload.metadata.width,
 						height: payload.metadata.height,
+						fps: payload.metadata.fps,
 						...(duration === undefined ? {} : { duration }),
 					})
 					.where(eq(videos.id, payload.videoId as Video.VideoId));
 			}
 
-			await db()
-				.delete(videoUploads)
+			const [currentVideo] = await db()
+				.select()
+				.from(videos)
+				.where(eq(videos.id, payload.videoId as Video.VideoId));
+			const [currentUpload] = await db()
+				.select({ rawFileKey: videoUploads.rawFileKey })
+				.from(videoUploads)
 				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+
+			if (currentVideo?.source?.type === "desktopSegments") {
+				await db()
+					.update(videos)
+					.set({ source: { type: "desktopMP4" as const } })
+					.where(eq(videos.id, payload.videoId as Video.VideoId));
+			}
+
+			const isEditUpload =
+				currentVideo &&
+				isEditSourceKey({
+					ownerId: currentVideo.ownerId,
+					videoId: payload.videoId,
+					rawFileKey: currentUpload?.rawFileKey,
+				});
+
+			if (isEditUpload) {
+				await db()
+					.update(videoUploads)
+					.set({
+						phase: "complete",
+						processingProgress: 100,
+						processingMessage: payload.message,
+						processingError: null,
+						updatedAt: new Date(),
+					})
+					.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+			} else {
+				await db()
+					.delete(videoUploads)
+					.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+			}
+			await invalidateGoogleDriveStorageQuotaCache(
+				currentVideo?.storageIntegrationId,
+			);
 		} else if (dbPhase === "error") {
-			await db()
-				.update(videoUploads)
-				.set({
-					phase: "error",
-					processingError: payload.error || payload.message || "Unknown error",
-					processingMessage: payload.message,
-					updatedAt: new Date(),
-				})
-				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+			const processingError =
+				payload.error || payload.message || "Unknown error";
+			if (isRetryableWorkflowError) {
+				await db()
+					.update(videoUploads)
+					.set({
+						phase: "processing",
+						processingProgress: Math.round(payload.progress),
+						processingError,
+						processingMessage: "Retrying video processing...",
+						updatedAt: new Date(),
+					})
+					.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+			} else {
+				await db()
+					.update(videoUploads)
+					.set({
+						phase: "error",
+						processingError,
+						processingMessage: payload.message,
+						updatedAt: new Date(),
+					})
+					.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+			}
 		} else {
 			await db()
 				.update(videoUploads)
@@ -113,6 +174,7 @@ export async function POST(request: NextRequest) {
 					phase: dbPhase,
 					processingProgress: Math.round(payload.progress),
 					processingMessage: payload.message,
+					processingError: null,
 					updatedAt: new Date(),
 				})
 				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));

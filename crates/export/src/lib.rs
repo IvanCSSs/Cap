@@ -1,8 +1,13 @@
 pub mod gif;
+pub mod mov;
 pub mod mp4;
+pub mod preview;
 
 use cap_editor::SegmentMedia;
-use cap_project::{ProjectConfiguration, RecordingMeta, StudioRecordingMeta};
+use cap_project::{
+    BackgroundSource, ProjectConfiguration, RecordingMeta, StudioRecordingMeta,
+    TimelineConfiguration, TimelineSegment,
+};
 use cap_rendering::{ProjectRecordingsMeta, RenderVideoConstants};
 use std::{path::PathBuf, sync::Arc};
 
@@ -61,6 +66,11 @@ impl ExporterBuilder {
         self
     }
 
+    pub fn with_output_path(mut self, output_path: PathBuf) -> Self {
+        self.output_path = Some(output_path);
+        self
+    }
+
     pub fn with_force_ffmpeg_decoder(mut self, force: bool) -> Self {
         self.force_ffmpeg_decoder = force;
         self
@@ -69,11 +79,12 @@ impl ExporterBuilder {
     pub async fn build(self) -> Result<ExporterBase, ExporterBuildError> {
         type Error = ExporterBuildError;
 
-        let project_config = serde_json::from_reader(
-            std::fs::File::open(self.project_path.join("project-config.json"))
-                .map_err(|v| Error::ConfigLoad(v.into()))?,
-        )
-        .map_err(|v| Error::ConfigLoad(v.into()))?;
+        let mut project_config = if let Some(config) = self.config {
+            config
+        } else {
+            ProjectConfiguration::load(&self.project_path)
+                .map_err(|v| Error::ConfigLoad(v.into()))?
+        };
 
         let recording_meta =
             RecordingMeta::load_for_project(&self.project_path).map_err(Error::MetaLoad)?;
@@ -85,6 +96,40 @@ impl ExporterBuilder {
             ProjectRecordingsMeta::new(&recording_meta.project_path, studio_meta)
                 .map_err(Error::RecordingsMeta)?,
         );
+
+        // A freshly recorded .cap has no timeline — only the editor creates one. Without it the
+        // render loop's get_segment_time() returns None on frame 0 and produces zero frames (an empty
+        // export). Synthesize the same default timeline the editor would (one segment per recording,
+        // spanning its full duration) so raw recordings — e.g. from `cap export` — render correctly.
+        // Desktop exports already carry a timeline by export time, so this only fires for un-edited
+        // projects and changes nothing for them.
+        if project_config.timeline.is_none() {
+            let segments: Vec<TimelineSegment> = recordings
+                .segments
+                .iter()
+                .enumerate()
+                .filter_map(|(i, segment)| {
+                    let duration = segment.duration();
+                    (duration > 0.0).then_some(TimelineSegment {
+                        recording_clip: i as u32,
+                        start: 0.0,
+                        end: duration,
+                        timescale: 1.0,
+                    })
+                })
+                .collect();
+            if !segments.is_empty() {
+                project_config.timeline = Some(TimelineConfiguration {
+                    segments,
+                    zoom_segments: Vec::new(),
+                    scene_segments: Vec::new(),
+                    mask_segments: Vec::new(),
+                    text_segments: Vec::new(),
+                    caption_segments: Vec::new(),
+                    keyboard_segments: Vec::new(),
+                });
+            }
+        }
 
         let render_constants = Arc::new(
             RenderVideoConstants::new(
@@ -121,6 +166,29 @@ impl ExporterBuilder {
             project_path: self.project_path,
         })
     }
+}
+
+pub fn make_cursor_only_project(mut project_config: ProjectConfiguration) -> ProjectConfiguration {
+    project_config.background.source = BackgroundSource::Color {
+        value: [0, 0, 0],
+        alpha: 0,
+    };
+    project_config.background.blur = 0.0;
+    project_config.background.shadow = 0.0;
+    project_config.background.advanced_shadow = None;
+    project_config.background.border = None;
+    project_config.camera.hide = true;
+    project_config.captions = None;
+    project_config.keyboard = None;
+
+    if let Some(timeline) = project_config.timeline.as_mut() {
+        timeline.mask_segments.clear();
+        timeline.text_segments.clear();
+        timeline.caption_segments.clear();
+        timeline.keyboard_segments.clear();
+    }
+
+    project_config
 }
 
 pub struct ExporterBase {

@@ -10,7 +10,7 @@ use std::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    CaptionsData, CursorEvents, CursorImage, ProjectConfiguration, XY,
+    CaptionsData, CursorEvents, CursorImage, KeyboardEvents, ProjectConfiguration, XY,
     cursor::SHORT_CURSOR_SHAPE_DEBOUNCE_MS,
 };
 
@@ -38,6 +38,25 @@ pub struct AudioMeta {
     pub start_time: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_summary: Option<AudioGapSummary>,
+}
+
+/// Overlap-trim accounting captured by the recorder's audio gap tracker, persisted so the
+/// editor can compensate for stale-startup audio drift from typed data instead of scraping
+/// the recording log. See `cap-editor`'s `audio_timing_repair_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AudioGapSummary {
+    /// Total audio trimmed from overlapping frames over the whole recording, in milliseconds.
+    pub total_overlap_trimmed_ms: u32,
+    /// Startup-window trim used for stale-startup repair, excluding mid-recording trims.
+    #[serde(default)]
+    pub startup_overlap_trimmed_ms: u32,
+    /// Number of whole audio frames dropped because they fully overlapped the committed timeline.
+    pub overlap_dropped_frames: u32,
+    /// Subset of `overlap_dropped_frames` that dropped within the first few frames — the
+    /// signature of a stale buffered burst at capture start.
+    pub startup_overlap_drops: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -104,6 +123,11 @@ pub enum UploadMeta {
         file_path: PathBuf,
         screenshot_path: PathBuf,
     },
+    SegmentUpload {
+        video_id: String,
+        pre_created_video: VideoUploadInfo,
+        recording_dir: PathBuf,
+    },
     Failed {
         error: String,
     },
@@ -136,6 +160,7 @@ impl RecordingMeta {
         let meta_path = project_path.join("recording-meta.json");
         let mut meta: Self = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
         meta.project_path = project_path.to_path_buf();
+        meta.normalize_paths();
 
         Ok(meta)
     }
@@ -168,6 +193,38 @@ impl RecordingMeta {
             debug!("No captions.json found");
         }
 
+        if let Some(ref captions) = config.captions {
+            let timeline_has_captions = config
+                .timeline
+                .as_ref()
+                .map(|t| !t.caption_segments.is_empty())
+                .unwrap_or(false);
+
+            if !timeline_has_captions && !captions.segments.is_empty() {
+                let caption_track_segments: Vec<crate::CaptionTrackSegment> = captions
+                    .segments
+                    .iter()
+                    .map(|seg| crate::CaptionTrackSegment {
+                        id: seg.id.clone(),
+                        start: seg.start as f64,
+                        end: seg.end as f64,
+                        text: seg.text.clone(),
+                        words: seg.words.clone(),
+                        fade_duration_override: None,
+                        linger_duration_override: None,
+                        position_override: None,
+                        color_override: None,
+                        background_color_override: None,
+                        font_size_override: None,
+                    })
+                    .collect();
+
+                if let Some(ref mut timeline) = config.timeline {
+                    timeline.caption_segments = caption_track_segments;
+                }
+            }
+        }
+
         config
     }
 
@@ -182,6 +239,72 @@ impl RecordingMeta {
         match &self.inner {
             RecordingMetaInner::Studio(meta) => Some(meta),
             _ => None,
+        }
+    }
+
+    fn normalize_paths(&mut self) {
+        let normalize_video = |meta: &mut VideoMeta| normalize_relative_path(&mut meta.path);
+        let normalize_audio = |meta: &mut AudioMeta| normalize_relative_path(&mut meta.path);
+        let normalize_cursor = |path: &mut Option<RelativePathBuf>| {
+            if let Some(path) = path {
+                normalize_relative_path(path);
+            }
+        };
+
+        match &mut self.inner {
+            RecordingMetaInner::Studio(meta) => match meta.as_mut() {
+                StudioRecordingMeta::SingleSegment { segment } => {
+                    normalize_video(&mut segment.display);
+                    if let Some(camera) = &mut segment.camera {
+                        normalize_video(camera);
+                    }
+                    if let Some(audio) = &mut segment.audio {
+                        normalize_audio(audio);
+                    }
+                    normalize_cursor(&mut segment.cursor);
+                }
+                StudioRecordingMeta::MultipleSegments { inner } => {
+                    for segment in &mut inner.segments {
+                        normalize_video(&mut segment.display);
+                        if let Some(camera) = &mut segment.camera {
+                            normalize_video(camera);
+                        }
+                        if let Some(mic) = &mut segment.mic {
+                            normalize_audio(mic);
+                        }
+                        if let Some(system_audio) = &mut segment.system_audio {
+                            normalize_audio(system_audio);
+                        }
+                        normalize_cursor(&mut segment.cursor);
+                    }
+
+                    if let Cursors::Correct(cursors) = &mut inner.cursors {
+                        for cursor in cursors.values_mut() {
+                            normalize_relative_path(&mut cursor.image_path);
+                        }
+                    }
+                }
+            },
+            RecordingMetaInner::Instant(_) => {}
+        }
+    }
+}
+
+fn normalize_relative_path(path: &mut RelativePathBuf) {
+    let original = path.as_str();
+    let normalized = original.replace('\\', "/");
+
+    if normalized.starts_with("content/")
+        || normalized.starts_with("screenshots/")
+        || normalized.starts_with("output/")
+    {
+        return;
+    }
+
+    for root in ["content/", "screenshots/", "output/"] {
+        if let Some(index) = normalized.find(root) {
+            *path = RelativePathBuf::from(&normalized[index..]);
+            return;
         }
     }
 }
@@ -361,6 +484,9 @@ pub struct MultipleSegment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[specta(type = Option<String>)]
     pub cursor: Option<RelativePathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub keyboard: Option<RelativePathBuf>,
 }
 
 impl MultipleSegment {
@@ -393,6 +519,35 @@ impl MultipleSegment {
         data.stabilize_short_lived_cursor_shapes(pointer_ids_ref, SHORT_CURSOR_SHAPE_DEBOUNCE_MS);
 
         data
+    }
+
+    pub fn keyboard_events(&self, meta: &RecordingMeta) -> KeyboardEvents {
+        let keyboard_path = self.keyboard.clone().or_else(|| {
+            let display_dir = self.display.path.parent()?;
+            let binary = display_dir.join(crate::KEYBOARD_EVENTS_FILE_NAME);
+            let binary_full = meta.path(&binary);
+            if binary_full.exists() {
+                return Some(binary);
+            }
+
+            let legacy = display_dir.join(crate::LEGACY_KEYBOARD_EVENTS_FILE_NAME);
+            let legacy_full = meta.path(&legacy);
+            legacy_full.exists().then_some(legacy)
+        });
+
+        let Some(keyboard_path) = keyboard_path else {
+            return KeyboardEvents::default();
+        };
+
+        let full_path = meta.path(&keyboard_path);
+
+        match KeyboardEvents::load_from_file(&full_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Failed to load keyboard data: {e}");
+                KeyboardEvents::default()
+            }
+        }
     }
 
     pub fn latest_start_time(&self) -> Option<f64> {

@@ -1,5 +1,6 @@
 "use client";
 
+import type { videos as videosSchema } from "@cap/database/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { buildEnv, NODE_ENV } from "@cap/env";
 import {
@@ -9,6 +10,7 @@ import {
 	DropdownMenuTrigger,
 } from "@cap/ui";
 import { calculateStrokeDashoffset, getProgressCircleConfig } from "@cap/utils";
+import type { SpaceRuleSource, ViewerSettingKey } from "@cap/web-backend";
 import type { ImageUpload, Video } from "@cap/web-domain";
 import { HttpClient } from "@effect/platform";
 import {
@@ -20,6 +22,7 @@ import {
 	faGear,
 	faLink,
 	faLock,
+	faScissors,
 	faShare,
 	faTrash,
 	faUnlock,
@@ -36,6 +39,7 @@ import { toast } from "sonner";
 import { ConfirmationDialog } from "@/app/(org)/dashboard/_components/ConfirmationDialog";
 import { useDashboardContext } from "@/app/(org)/dashboard/Contexts";
 import { useUploadProgress } from "@/app/s/[videoId]/_components/ProgressCircle";
+import { UpgradeModal } from "@/components/UpgradeModal";
 import {
 	type ImageLoadingStatus,
 	VideoThumbnail,
@@ -85,10 +89,20 @@ export interface CapCardProps extends PropsWithChildren {
 			name: string;
 			iconUrl?: ImageUpload.ImageUrl | null;
 			organizationId: string;
+			isOrg?: boolean;
+			settings?: Partial<Record<ViewerSettingKey, boolean>> | null;
+			hasPassword?: boolean;
 		}[];
 		ownerName: string | null;
 		metadata?: VideoMetadata;
+		source?: typeof videosSchema.$inferSelect.source;
+		isScreenshot?: boolean;
 		hasPassword?: boolean;
+		hasInheritedPassword?: boolean;
+		inheritedPasswordSources?: SpaceRuleSource[];
+		inheritedSpaceSettings?: Partial<
+			Record<ViewerSettingKey, SpaceRuleSource[]>
+		>;
 		hasActiveUpload: boolean | undefined;
 		duration?: number;
 		settings?: {
@@ -98,7 +112,7 @@ export interface CapCardProps extends PropsWithChildren {
 			disableChapters?: boolean;
 			disableReactions?: boolean;
 			disableTranscript?: boolean;
-		};
+		} | null;
 	};
 	analytics: number;
 	isLoadingAnalytics: boolean;
@@ -138,12 +152,15 @@ export const CapCard = ({
 	const [passwordProtected, setPasswordProtected] = useState(
 		cap.hasPassword || false,
 	);
+	const effectivePasswordProtected =
+		passwordProtected || Boolean(cap.hasInheritedPassword);
 	const { webUrl } = usePublicEnv();
 
 	const [copyPressed, setCopyPressed] = useState(false);
 	const [isDragging, setIsDragging] = useState(false);
 	const [isSettingsDialogOpen, setIsSettingsDialogOpen] = useState(false);
 	const { user, setUpgradeModalOpen } = useDashboardContext();
+	const [editUpgradeModalOpen, setEditUpgradeModalOpen] = useState(false);
 
 	const [confirmOpen, setConfirmOpen] = useState(false);
 
@@ -213,8 +230,12 @@ export const CapCard = ({
 		cap.id,
 		cap.hasActiveUpload || false,
 	);
+	const hasRawFallback =
+		uploadProgress?.status === "error" && uploadProgress.hasRawFallback;
 	const hasVisibleUploadProgress =
-		uploadProgress !== null && uploadProgress.status !== "fetching";
+		uploadProgress !== null &&
+		uploadProgress.status !== "fetching" &&
+		!hasRawFallback;
 	const [imageStatus, setImageStatus] = useState<ImageLoadingStatus>("loading");
 	const prevUploadProgressRef = useRef(uploadProgress);
 
@@ -257,7 +278,7 @@ export const CapCard = ({
 		return element;
 	};
 
-	const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+	const handleDragStart = (e: React.DragEvent<HTMLElement>) => {
 		if (anyCapSelected || !isOwner) return;
 
 		// Set the data transfer
@@ -314,16 +335,6 @@ export const CapCard = ({
 		});
 	};
 
-	const handleCardClick = (e: React.MouseEvent) => {
-		if (anyCapSelected) {
-			e.preventDefault();
-			e.stopPropagation();
-			if (onSelectToggle) {
-				onSelectToggle();
-			}
-		}
-	};
-
 	const handleSelectClick = (e: React.MouseEvent) => {
 		e.preventDefault();
 		e.stopPropagation();
@@ -343,9 +354,28 @@ export const CapCard = ({
 						: `${webUrl}/s/${cap.id}`,
 		);
 	};
+	const canEditVideo =
+		isOwner &&
+		!sharedCapCard &&
+		cap.isScreenshot !== true &&
+		!cap.hasActiveUpload &&
+		(cap.source?.type === "desktopMP4" || cap.source?.type === "webMP4") &&
+		Boolean(cap.duration && cap.duration > 0);
+	const handleEditVideo = () => {
+		if (!canEditVideo) return;
+		if (!user.isPro) {
+			setEditUpgradeModalOpen(true);
+			return;
+		}
+		router.push(`/s/${cap.id}/edit`);
+	};
 
 	return (
 		<>
+			<UpgradeModal
+				open={editUpgradeModalOpen}
+				onOpenChange={setEditUpgradeModalOpen}
+			/>
 			<SharingDialog
 				isOpen={isSharingDialogOpen}
 				onClose={() => setIsSharingDialogOpen(false)}
@@ -355,11 +385,13 @@ export const CapCard = ({
 				onSharingUpdated={handleSharingUpdated}
 				isPublic={cap.public}
 				hasPassword={passwordProtected}
+				inheritedPasswordSources={cap.inheritedPasswordSources}
 				onPasswordUpdated={handlePasswordUpdated}
 			/>
 			<SettingsDialog
 				isOpen={isSettingsDialogOpen}
-				settingsData={cap.settings}
+				settingsData={cap.settings ?? undefined}
+				inheritedSpaceSettings={cap.inheritedSpaceSettings}
 				capId={cap.id}
 				onClose={() => setIsSettingsDialogOpen(false)}
 			/>
@@ -370,8 +402,8 @@ export const CapCard = ({
 				hasPassword={passwordProtected}
 				onPasswordUpdated={handlePasswordUpdated}
 			/>
-			<div
-				onClick={handleCardClick}
+			<fieldset
+				aria-label={cap.name}
 				draggable={isOwner && !anyCapSelected}
 				onDragStart={handleDragStart}
 				onDragEnd={handleDragEnd}
@@ -387,7 +419,12 @@ export const CapCard = ({
 				)}
 			>
 				{anyCapSelected && !sharedCapCard && (
-					<div className="absolute inset-0 z-10" onClick={handleCardClick} />
+					<button
+						type="button"
+						aria-label={`Select ${cap.name}`}
+						className="absolute inset-0 z-10"
+						onClick={handleSelectClick}
+					/>
 				)}
 
 				<div
@@ -426,6 +463,7 @@ export const CapCard = ({
 									strokeWidth="2"
 									strokeLinecap="round"
 									strokeLinejoin="round"
+									aria-hidden="true"
 									className="text-gray-12 size-5 svgpathanimation"
 								>
 									<path d="M20 6 9 17l-5-5" />
@@ -523,6 +561,18 @@ export const CapCard = ({
 										<FontAwesomeIcon className="size-3" icon={faCopy} />
 										<p className="text-sm text-gray-12">Duplicate</p>
 									</DropdownMenuItem>
+									{canEditVideo && (
+										<DropdownMenuItem
+											onClick={(e) => {
+												e.stopPropagation();
+												handleEditVideo();
+											}}
+											className="flex gap-2 items-center rounded-lg"
+										>
+											<FontAwesomeIcon className="size-3" icon={faScissors} />
+											<p className="text-sm text-gray-12">Edit video</p>
+										</DropdownMenuItem>
+									)}
 									<DropdownMenuItem
 										onClick={() => {
 											if (!user.isPro) setUpgradeModalOpen(true);
@@ -532,7 +582,7 @@ export const CapCard = ({
 									>
 										<FontAwesomeIcon
 											className="size-3"
-											icon={passwordProtected ? faLock : faUnlock}
+											icon={effectivePasswordProtected ? faLock : faUnlock}
 										/>
 										<p className="text-sm text-gray-12">
 											{passwordProtected ? "Edit password" : "Add password"}
@@ -567,7 +617,9 @@ export const CapCard = ({
 				</div>
 
 				{!sharedCapCard && onSelectToggle && (
-					<div
+					<button
+						type="button"
+						aria-label={isSelected ? "Deselect cap" : "Select cap"}
 						className={clsx(
 							"absolute top-2 left-2 z-[49] duration-200",
 							isSelected || anyCapSelected || isDropdownOpen
@@ -591,7 +643,7 @@ export const CapCard = ({
 								<FontAwesomeIcon icon={faCheck} className="text-white size-3" />
 							)}
 						</div>
-					</div>
+					</button>
 				)}
 
 				<div className="relative aspect-video w-full">
@@ -637,6 +689,7 @@ export const CapCard = ({
 												<svg
 													className="w-4 h-4 animate-spin"
 													viewBox="0 0 20 20"
+													aria-hidden="true"
 												>
 													<circle
 														cx="10"
@@ -663,6 +716,7 @@ export const CapCard = ({
 												<svg
 													className="w-4 h-4 transform -rotate-90"
 													viewBox="0 0 20 20"
+													aria-hidden="true"
 												>
 													<circle
 														cx="10"
@@ -722,6 +776,18 @@ export const CapCard = ({
 								uploadProgress.status !== "error"
 							}
 						/>
+						{effectivePasswordProtected && (
+							<div
+								className="absolute right-2 top-2 z-10 flex size-7 items-center justify-center rounded-full bg-black/70 text-white"
+								title={
+									cap.hasInheritedPassword
+										? "Password required by space"
+										: "Password protected"
+								}
+							>
+								<FontAwesomeIcon icon={faLock} className="size-3" />
+							</div>
+						)}
 					</Link>
 				</div>
 				<div
@@ -747,7 +813,7 @@ export const CapCard = ({
 						totalReactions={cap.totalReactions}
 					/>
 				</div>
-			</div>
+			</fieldset>
 		</>
 	);
 };

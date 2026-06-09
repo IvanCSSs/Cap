@@ -8,14 +8,19 @@ import { createMutation, createQuery, skipToken } from "@tanstack/solid-query";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { Menu } from "@tauri-apps/api/menu";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
 	createEffect,
 	createMemo,
 	createResource,
 	createSignal,
+	ErrorBoundary,
+	For,
 	Match,
 	on,
 	onCleanup,
+	onMount,
 	Show,
 	Switch,
 } from "solid-js";
@@ -38,6 +43,7 @@ import {
 	EditorContextProvider,
 	EditorInstanceContextProvider,
 	FPS,
+	isModalDialog,
 	serializeProjectConfiguration,
 	useEditorContext,
 	useEditorInstanceContext,
@@ -48,22 +54,66 @@ import { Header } from "./Header";
 import { ImportProgress } from "./ImportProgress";
 import { PlayerContent } from "./Player";
 import { Timeline } from "./Timeline";
+import { TranscriptPanel } from "./TranscriptPage";
 import { Dialog, DialogContent, EditorButton, Input, Subfield } from "./ui";
 
 const DEFAULT_TIMELINE_HEIGHT = 260;
 const MIN_PLAYER_CONTENT_HEIGHT = 320;
 const MIN_TIMELINE_HEIGHT = 240;
-const RESIZE_HANDLE_HEIGHT = 8;
+const RESIZE_HANDLE_HEIGHT = 16;
 const MIN_PLAYER_HEIGHT = MIN_PLAYER_CONTENT_HEIGHT + RESIZE_HANDLE_HEIGHT;
+const TIMELINE_RESIZE_GRIP_MARKS = [0, 1, 2] as const;
+
+function logCropProfile(
+	stage: string,
+	data: Record<string, number | string | boolean | null> = {},
+) {
+	if (!import.meta.env.DEV) return;
+	console.info("[crop-profile]", stage, data);
+}
+
+function getEditorErrorMessage(error: unknown) {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function getPreviewProjectConfig(
+	project: ReturnType<typeof useEditorContext>["project"],
+	editorState: ReturnType<typeof useEditorContext>["editorState"],
+) {
+	const config = serializeProjectConfiguration(project);
+
+	if (!editorState.timeline.tracks.caption && config.captions) {
+		config.captions = {
+			...config.captions,
+			settings: {
+				...config.captions.settings,
+				enabled: false,
+			},
+		};
+	}
+
+	if (!editorState.timeline.tracks.keyboard && config.keyboard) {
+		config.keyboard = {
+			...config.keyboard,
+			settings: {
+				...config.keyboard.settings,
+				enabled: false,
+			},
+		};
+	}
+
+	return config;
+}
 
 export function Editor() {
 	const [projectPath] = createResource(() => commands.getEditorProjectPath());
 
 	const rawMetaQuery = createQuery(() => ({
 		queryKey: ["editor", "raw-meta", projectPath()],
-		queryFn: projectPath()
-			? () => commands.getRecordingMetaByPath(projectPath()!)
-			: skipToken,
+		queryFn: (() => {
+			const path = projectPath();
+			return path ? () => commands.getRecordingMetaByPath(path) : skipToken;
+		})(),
 		staleTime: Infinity,
 		gcTime: 0,
 		refetchOnWindowFocus: false,
@@ -134,17 +184,32 @@ export function Editor() {
 				</div>
 			}
 		>
-			<Match when={importStatus() === "importing" && projectPath()}>
-				<ImportProgress
-					projectPath={projectPath()!}
-					onComplete={handleImportComplete}
-					onError={(error) => console.error("Import failed:", error)}
-				/>
+			<Match
+				when={importStatus() === "importing" ? (projectPath() ?? null) : null}
+			>
+				{(path) => (
+					<ImportProgress
+						projectPath={path()}
+						onComplete={handleImportComplete}
+						onError={(error) => console.error("Import failed:", error)}
+					/>
+				)}
 			</Match>
-			<Match when={importStatus() === "ready" && projectPath()}>
-				<EditorInstanceContextProvider>
-					<EditorContent projectPath={projectPath()!} />
-				</EditorInstanceContextProvider>
+			<Match when={importStatus() === "ready" ? (projectPath() ?? null) : null}>
+				{(path) => (
+					<ErrorBoundary
+						fallback={(error) => (
+							<EditorErrorScreen
+								error={getEditorErrorMessage(error)}
+								projectPath={path()}
+							/>
+						)}
+					>
+						<EditorInstanceContextProvider>
+							<EditorContent projectPath={path()} />
+						</EditorInstanceContextProvider>
+					</ErrorBoundary>
+				)}
 			</Match>
 		</Switch>
 	);
@@ -156,12 +221,12 @@ function EditorContent(props: { projectPath: string }) {
 	const errorInfo = () => {
 		const error = ctx.editorInstance.error;
 		if (!error) return null;
-		const errorMessage = error instanceof Error ? error.message : String(error);
+		const errorMessage = getEditorErrorMessage(error);
 		return { error: errorMessage, projectPath: props.projectPath };
 	};
 
 	const readyData = () => {
-		const editorInstance = ctx.editorInstance();
+		const editorInstance = ctx.editorInstance.latest;
 		if (!editorInstance || !ctx.metaQuery.data) return null;
 
 		return {
@@ -206,6 +271,7 @@ function Inner() {
 		setEditorState,
 		previewResolutionBase,
 		dialog,
+		exportState,
 	} = useEditorContext();
 
 	const isExportMode = () => {
@@ -213,10 +279,56 @@ function Inner() {
 		return "type" in d && d.type === "export" && d.open;
 	};
 
+	const isTranscriptMode = () => {
+		const d = dialog();
+		return "type" in d && d.type === "transcript" && d.open;
+	};
+
 	const isCropMode = () => {
 		const d = dialog();
 		return "type" in d && d.type === "crop" && d.open;
 	};
+
+	const currentWindow = getCurrentWindow();
+	let allowExportClose = false;
+	let closePromptOpen = false;
+
+	onMount(async () => {
+		const unlisten = await currentWindow.onCloseRequested(async (event) => {
+			if (
+				allowExportClose ||
+				exportState.type === "idle" ||
+				exportState.type === "done"
+			) {
+				return;
+			}
+
+			event.preventDefault();
+			if (closePromptOpen) return;
+
+			closePromptOpen = true;
+			try {
+				const resumeExport = await ask(
+					"An export is currently running. Keep this editor open to continue it, or quit the editor and cancel the export.",
+					{
+						title: "Export in Progress",
+						kind: "warning",
+						okLabel: "Resume Export",
+						cancelLabel: "Quit Editor",
+					},
+				);
+
+				if (!resumeExport) {
+					allowExportClose = true;
+					await currentWindow.close();
+				}
+			} finally {
+				closePromptOpen = false;
+			}
+		});
+
+		onCleanup(() => unlisten());
+	});
 
 	const [layoutRef, setLayoutRef] = createSignal<HTMLDivElement>();
 	const layoutBounds = createElementBounds(layoutRef);
@@ -225,6 +337,10 @@ function Inner() {
 		{ name: "editorTimelineHeight" },
 	);
 	const [isResizingTimeline, setIsResizingTimeline] = createSignal(false);
+	const [timelineViewportOverflow, setTimelineViewportOverflow] = createSignal<{
+		overflow: number;
+		visibleTrackCount: number;
+	} | null>(null);
 
 	const clampTimelineHeight = (value: number) => {
 		const available = layoutBounds.height ?? 0;
@@ -270,13 +386,35 @@ function Inner() {
 		setStoredTimelineHeight((height) => clampTimelineHeight(height));
 	});
 
+	createEffect(
+		on(timelineViewportOverflow, (next, prev) => {
+			if (
+				next &&
+				prev &&
+				next.visibleTrackCount > prev.visibleTrackCount &&
+				next.overflow > 0
+			) {
+				setStoredTimelineHeight((height) =>
+					clampTimelineHeight(height + next.overflow),
+				);
+			}
+
+			return next;
+		}),
+	);
+
 	createTauriEventListener(events.editorStateChanged, (payload) => {
 		throttledRenderFrame.clear();
 		trailingRenderFrame.clear();
 		setEditorState("playbackTime", payload.playhead_position / FPS);
 	});
 
+	let skipRenderFrameForConfigUpdate = false;
+
 	const emitRenderFrame = (time: number) => {
+		if (skipRenderFrameForConfigUpdate) {
+			return;
+		}
 		if (!editorState.playing) {
 			events.renderFrameEvent.emit({
 				frame_number: Math.max(Math.floor(time * FPS), 0),
@@ -300,6 +438,77 @@ function Inner() {
 		if (preview !== null) return preview;
 		return editorState.playbackTime;
 	});
+
+	type PreviewConfigUpdate = {
+		config: ReturnType<typeof getPreviewProjectConfig>;
+		frameNumber: number;
+		resolutionBase: ReturnType<typeof previewResolutionBase>;
+	};
+
+	let previewConfigUpdateInFlight = false;
+	let pendingPreviewConfigUpdate: PreviewConfigUpdate | null = null;
+
+	const flushPreviewConfigUpdate = async () => {
+		if (previewConfigUpdateInFlight) return;
+		const next = pendingPreviewConfigUpdate;
+		if (!next) return;
+
+		pendingPreviewConfigUpdate = null;
+		previewConfigUpdateInFlight = true;
+
+		try {
+			await commands.updateProjectConfigInMemory(
+				next.config,
+				next.frameNumber,
+				FPS,
+				next.resolutionBase,
+			);
+		} catch (e) {
+			console.error(
+				"[Editor] doConfigUpdate - ERROR sending config to Rust:",
+				e,
+			);
+		} finally {
+			previewConfigUpdateInFlight = false;
+			if (pendingPreviewConfigUpdate) void flushPreviewConfigUpdate();
+		}
+	};
+
+	const doConfigUpdate = (time: number) => {
+		pendingPreviewConfigUpdate = {
+			config: getPreviewProjectConfig(project, editorState),
+			frameNumber: Math.max(Math.floor(time * FPS), 0),
+			resolutionBase: previewResolutionBase(),
+		};
+		void flushPreviewConfigUpdate();
+	};
+
+	const throttledConfigUpdate = throttle(doConfigUpdate, 1000 / FPS);
+	const trailingConfigUpdate = debounce(doConfigUpdate, 1000 / FPS + 16);
+	const updateConfigAndRender = (time: number) => {
+		throttledConfigUpdate(time);
+		trailingConfigUpdate(time);
+	};
+
+	createEffect(
+		on(
+			() => {
+				trackDeep(project);
+				return {
+					caption: editorState.timeline.tracks.caption,
+					keyboard: editorState.timeline.tracks.keyboard,
+				};
+			},
+			() => {
+				skipRenderFrameForConfigUpdate = true;
+				queueMicrotask(() => {
+					skipRenderFrameForConfigUpdate = false;
+				});
+				updateConfigAndRender(frameNumberToRender());
+			},
+			{ defer: true },
+		),
+	);
 
 	createEffect(
 		on(
@@ -328,44 +537,55 @@ function Inner() {
 		}),
 	);
 
-	const doConfigUpdate = async (time: number) => {
-		const config = serializeProjectConfiguration(project);
-		const frameNumber = Math.max(Math.floor(time * FPS), 0);
-		const resBase = previewResolutionBase();
-		try {
-			await commands.updateProjectConfigInMemory(
-				config,
-				frameNumber,
-				FPS,
-				resBase,
-			);
-		} catch (e) {
-			console.error(
-				"[Editor] doConfigUpdate - ERROR sending config to Rust:",
-				e,
-			);
-		}
+	const fullscreenMode = () => {
+		if (isExportMode()) return "export" as const;
+		return null;
 	};
-	const throttledConfigUpdate = throttle(doConfigUpdate, 1000 / FPS);
-	const trailingConfigUpdate = debounce(doConfigUpdate, 1000 / FPS + 16);
-	const updateConfigAndRender = (time: number) => {
-		throttledConfigUpdate(time);
-		trailingConfigUpdate(time);
-	};
-	createEffect(
-		on(
-			() => {
-				trackDeep(project);
-			},
-			() => {
-				updateConfigAndRender(frameNumberToRender());
-			},
-			{ defer: true },
-		),
+
+	const MIN_SPLIT_RATIO = 0.25;
+	const MAX_SPLIT_RATIO = 0.75;
+	const DEFAULT_SPLIT_RATIO = 0.5;
+
+	const [splitRatio, setSplitRatio] = makePersisted(
+		createSignal(DEFAULT_SPLIT_RATIO),
+		{ name: "editorTranscriptSplitRatio" },
 	);
+	const [isResizingSplit, setIsResizingSplit] = createSignal(false);
+	const [splitContainerRef, setSplitContainerRef] =
+		createSignal<HTMLDivElement>();
+
+	const handleSplitResizeStart = (event: MouseEvent) => {
+		if (event.button !== 0) return;
+		event.preventDefault();
+		const startX = event.clientX;
+		const startRatio = splitRatio();
+		const container = splitContainerRef();
+		if (!container) return;
+		const containerWidth = container.offsetWidth;
+		setIsResizingSplit(true);
+
+		const handleMove = (moveEvent: MouseEvent) => {
+			const delta = moveEvent.clientX - startX;
+			const ratioDelta = delta / containerWidth;
+			const newRatio = Math.min(
+				MAX_SPLIT_RATIO,
+				Math.max(MIN_SPLIT_RATIO, startRatio + ratioDelta),
+			);
+			setSplitRatio(newRatio);
+		};
+
+		const handleUp = () => {
+			setIsResizingSplit(false);
+			window.removeEventListener("mousemove", handleMove);
+			window.removeEventListener("mouseup", handleUp);
+		};
+
+		window.addEventListener("mousemove", handleMove);
+		window.addEventListener("mouseup", handleUp);
+	};
 
 	return (
-		<Show when={!isExportMode()} fallback={<ExportPage />}>
+		<Show when={!fullscreenMode()} fallback={<ExportPage />}>
 			<div class="flex flex-col flex-1 min-h-0 animate-in fade-in duration-300">
 				<Header />
 				<div
@@ -377,39 +597,91 @@ function Inner() {
 						class="flex overflow-hidden flex-col flex-1 min-h-0"
 					>
 						<div
-							class="flex overflow-y-hidden flex-row flex-1 min-h-0 gap-2 px-2"
+							ref={setSplitContainerRef}
+							class="flex overflow-hidden flex-row flex-1 min-h-0 px-2"
 							style={{
 								"min-height": `${MIN_PLAYER_HEIGHT}px`,
 							}}
 						>
-							<div class="flex flex-col flex-1 rounded-xl border bg-gray-1 dark:bg-gray-2 border-gray-3 overflow-hidden">
+							<div
+								class="flex flex-col rounded-xl border bg-gray-1 dark:bg-gray-2 border-gray-3 overflow-hidden"
+								style={{
+									flex: isTranscriptMode()
+										? `0 0 ${splitRatio() * 100}%`
+										: "1 1 0%",
+									"min-width": "0",
+								}}
+							>
 								<PlayerContent />
 								<div
 									role="separator"
 									aria-orientation="horizontal"
-									class="flex-none transition-colors hover:bg-gray-3/30"
+									class="flex-none shrink-0 border-t border-gray-4 dark:border-gray-5 bg-gray-2/95 dark:bg-gray-3/55 transition-colors hover:bg-gray-3/70 dark:hover:bg-gray-4/55"
 									style={{ height: `${RESIZE_HANDLE_HEIGHT}px` }}
 								>
 									<div
-										class="flex justify-center items-center h-full cursor-row-resize select-none group"
-										classList={{ "bg-gray-3/50": isResizingTimeline() }}
+										class="flex flex-col gap-0.5 justify-center items-center h-full w-full cursor-row-resize select-none group"
+										classList={{
+											"bg-gray-3/55 dark:bg-gray-4/50": isResizingTimeline(),
+										}}
 										onMouseDown={handleTimelineResizeStart}
+										aria-label="Resize timeline height"
 									>
-										<div
-											class="h-1 w-12 rounded-full bg-gray-4 transition-colors group-hover:bg-gray-6"
-											classList={{ "bg-gray-7": isResizingTimeline() }}
-										/>
+										<For each={TIMELINE_RESIZE_GRIP_MARKS}>
+											{() => (
+												<div
+													class="h-0.5 w-20 max-w-[85%] rounded-full bg-gray-6 dark:bg-gray-7 shadow-[0_1px_0_rgb(0_0_0_/0.06)] transition-colors group-hover:bg-gray-9 dark:group-hover:bg-gray-11"
+													classList={{
+														"bg-gray-9 dark:bg-gray-11": isResizingTimeline(),
+													}}
+												/>
+											)}
+										</For>
 									</div>
 								</div>
 							</div>
-							<ConfigSidebar />
+							<Show when={!isTranscriptMode()}>
+								<div class="ml-2 flex min-h-0 w-104 min-w-104 flex-none overflow-hidden">
+									<ConfigSidebar />
+								</div>
+							</Show>
+							<Show when={isTranscriptMode()}>
+								<div
+									class="flex-none flex items-center justify-center cursor-col-resize select-none group z-10"
+									style={{ width: "12px" }}
+									onMouseDown={handleSplitResizeStart}
+									aria-label="Resize transcript panel"
+									role="separator"
+									aria-orientation="vertical"
+								>
+									<div
+										class="w-1 h-10 rounded-full bg-gray-6 dark:bg-gray-7 transition-colors group-hover:bg-gray-9 dark:group-hover:bg-gray-11"
+										classList={{
+											"bg-gray-9 dark:bg-gray-11": isResizingSplit(),
+										}}
+									/>
+								</div>
+								<div
+									class="flex flex-col min-h-0 overflow-hidden rounded-xl border bg-gray-1 dark:bg-gray-2 border-gray-3 animate-in fade-in duration-150"
+									style={{
+										flex: isResizingSplit()
+											? `0 0 calc(${(1 - splitRatio()) * 100}% - 12px)`
+											: `0 0 calc(${(1 - splitRatio()) * 100}% - 12px)`,
+										"min-width": "0",
+									}}
+								>
+									<TranscriptPanel />
+								</div>
+							</Show>
 						</div>
 						<div
 							class="flex-none min-h-0 px-2 pb-0.5 overflow-hidden relative"
 							style={{ height: `${timelineHeight()}px` }}
 						>
 							<div class="h-full">
-								<Timeline />
+								<Timeline
+									onViewportOverflowChange={setTimelineViewportOverflow}
+								/>
 							</div>
 						</div>
 					</div>
@@ -423,6 +695,8 @@ function Inner() {
 function Dialogs() {
 	const { dialog, setDialog, presets, project } = useEditorContext();
 
+	const isDialogType = () => isModalDialog(dialog());
+
 	return (
 		<Dialog.Root
 			size={(() => {
@@ -435,7 +709,7 @@ function Dialogs() {
 				if ("type" in d && d.type === "export") return "max-w-[740px]";
 				return "";
 			})()}
-			open={dialog().open}
+			open={isDialogType()}
 			onOpenChange={(o) => {
 				if (!o) setDialog((d) => ({ ...d, open: false }));
 			}}
@@ -443,7 +717,7 @@ function Dialogs() {
 			<Show
 				when={(() => {
 					const d = dialog();
-					if ("type" in d && d.type !== "export") return d;
+					if (isModalDialog(d)) return d;
 				})()}
 			>
 				{(dialog) => (
@@ -501,7 +775,7 @@ function Dialogs() {
 						>
 							{(dialog) => {
 								const [name, setName] = createSignal(
-									presets.query.data?.presets[dialog().presetIndex].name!,
+									presets.query.data?.presets[dialog().presetIndex]?.name ?? "",
 								);
 
 								const renamePreset = createMutation(() => ({
@@ -586,24 +860,195 @@ function Dialogs() {
 								const [crop, setCrop] = createSignal(CROP_ZERO);
 								const [aspect, setAspect] = createSignal<Ratio | null>(null);
 
+								const initialPreviewUrl = dialog().previewUrl ?? null;
 								const [frameBlobUrl, setFrameBlobUrl] = createSignal<
 									string | null
-								>(null);
+								>(initialPreviewUrl);
+								const [frameSource, setFrameSource] = createSignal<
+									"captured-preview" | "accurate-frame" | "screenshot"
+								>(initialPreviewUrl ? "captured-preview" : "screenshot");
+								const cropOpenedAt = performance.now();
+								const screenshotSrc = convertFileSrc(
+									`${editorInstance.path}/screenshots/display.jpg`,
+								);
 
-								commands
-									.getDisplayFrameForCropping(FPS)
-									.then((pngBytes) => {
-										const blob = new Blob([new Uint8Array(pngBytes)], {
-											type: "image/png",
-										});
-										const url = URL.createObjectURL(blob);
-										setFrameBlobUrl(url);
-									})
-									.catch((error: unknown) => {
-										console.warn("Display frame fetch failed:", error);
+								let cancelled = false;
+								let frameLoadDelayTimeoutId:
+									| ReturnType<typeof globalThis.setTimeout>
+									| undefined;
+								let frameLoadTimeoutId:
+									| ReturnType<typeof globalThis.setTimeout>
+									| undefined;
+								let frameLoadIdleId: number | undefined;
+								let accurateFrameRequested = false;
+								const idleWindow = globalThis as typeof globalThis & {
+									requestIdleCallback?: (
+										callback: () => void,
+										options?: { timeout?: number },
+									) => number;
+									cancelIdleCallback?: (handle: number) => void;
+								};
+
+								const clearScheduledAccurateFrame = () => {
+									if (frameLoadDelayTimeoutId !== undefined) {
+										globalThis.clearTimeout(frameLoadDelayTimeoutId);
+										frameLoadDelayTimeoutId = undefined;
+									}
+									if (frameLoadIdleId !== undefined) {
+										idleWindow.cancelIdleCallback?.(frameLoadIdleId);
+										frameLoadIdleId = undefined;
+									}
+									if (frameLoadTimeoutId !== undefined) {
+										globalThis.clearTimeout(frameLoadTimeoutId);
+										frameLoadTimeoutId = undefined;
+									}
+								};
+
+								const setPreviewBlob = (
+									blob: Blob,
+									source: "accurate-frame",
+								) => {
+									const nextUrl = URL.createObjectURL(blob);
+									const previousUrl = frameBlobUrl();
+									setFrameBlobUrl(nextUrl);
+									setFrameSource(source);
+									if (previousUrl) {
+										URL.revokeObjectURL(previousUrl);
+									}
+								};
+
+								const requestAccurateFrame = (reason: string) => {
+									if (accurateFrameRequested || cancelled) return;
+
+									clearScheduledAccurateFrame();
+
+									accurateFrameRequested = true;
+									const frameRequestStartedAt = performance.now();
+									logCropProfile("accurate-frame-request-start", {
+										elapsedMs: Number(
+											(frameRequestStartedAt - cropOpenedAt).toFixed(2),
+										),
+										reason,
 									});
 
+									void commands
+										.getDisplayFrameForCropping(FPS)
+										.then((pngBytes) => {
+											if (cancelled) return;
+
+											setPreviewBlob(
+												new Blob([new Uint8Array(pngBytes)], {
+													type: "image/png",
+												}),
+												"accurate-frame",
+											);
+											logCropProfile("accurate-frame-request-finish", {
+												elapsedMs: Number(
+													(performance.now() - cropOpenedAt).toFixed(2),
+												),
+												requestMs: Number(
+													(performance.now() - frameRequestStartedAt).toFixed(
+														2,
+													),
+												),
+												reason,
+											});
+										})
+										.catch((error: unknown) => {
+											if (cancelled) return;
+											console.warn("Display frame fetch failed:", error);
+											logCropProfile("accurate-frame-request-failed", {
+												elapsedMs: Number(
+													(performance.now() - cropOpenedAt).toFixed(2),
+												),
+												requestMs: Number(
+													(performance.now() - frameRequestStartedAt).toFixed(
+														2,
+													),
+												),
+												message:
+													error instanceof Error
+														? error.message
+														: String(error),
+												reason,
+											});
+										});
+								};
+
+								const scheduleAccurateFrame = (
+									reason: string,
+									options: {
+										delayMs?: number;
+										idleTimeoutMs: number;
+										fallbackDelayMs: number;
+									},
+								) => {
+									const queueIdleFrame = () => {
+										const loadFrame = () => requestAccurateFrame(reason);
+
+										if (idleWindow.requestIdleCallback) {
+											frameLoadIdleId = idleWindow.requestIdleCallback(
+												() => {
+													frameLoadIdleId = undefined;
+													loadFrame();
+												},
+												{
+													timeout: options.idleTimeoutMs,
+												},
+											);
+											return;
+										}
+
+										frameLoadTimeoutId = globalThis.setTimeout(() => {
+											frameLoadTimeoutId = undefined;
+											loadFrame();
+										}, options.fallbackDelayMs);
+									};
+
+									if (!options.delayMs) {
+										queueIdleFrame();
+										return;
+									}
+
+									frameLoadDelayTimeoutId = globalThis.setTimeout(() => {
+										frameLoadDelayTimeoutId = undefined;
+										if (cancelled || accurateFrameRequested) return;
+										queueIdleFrame();
+									}, options.delayMs);
+								};
+
+								onMount(() => {
+									logCropProfile("dialog-mounted", {
+										elapsedMs: Number(
+											(performance.now() - cropOpenedAt).toFixed(2),
+										),
+										recordingDurationSec: Math.round(
+											editorInstance.recordingDuration,
+										),
+									});
+
+									if (initialPreviewUrl) {
+										logCropProfile("accurate-frame-skipped", {
+											elapsedMs: Number(
+												(performance.now() - cropOpenedAt).toFixed(2),
+											),
+											recordingDurationSec: Math.round(
+												editorInstance.recordingDuration,
+											),
+											reason: "current-preview-available",
+										});
+										return;
+									}
+
+									scheduleAccurateFrame("immediate", {
+										idleTimeoutMs: 500,
+										fallbackDelayMs: 16,
+									});
+								});
+
 								onCleanup(() => {
+									cancelled = true;
+									clearScheduledAccurateFrame();
 									const url = frameBlobUrl();
 									if (url) {
 										URL.revokeObjectURL(url);
@@ -627,6 +1072,7 @@ function Dialogs() {
 									positionAtCursor = false,
 								) {
 									e.preventDefault();
+									e.stopPropagation();
 									const items = createCropOptionsMenuItems({
 										aspect: aspect(),
 										snapToRatioEnabled: snapToRatio(),
@@ -637,12 +1083,11 @@ function Dialogs() {
 									let pos: LogicalPosition | undefined;
 									if (!positionAtCursor) {
 										const rect = (
-											e.target as HTMLDivElement
+											e.currentTarget as HTMLDivElement
 										).getBoundingClientRect();
 										pos = new LogicalPosition(rect.x, rect.y + 40);
 									}
 									await menu.popup(pos);
-									await menu.close();
 								}
 
 								function BoundInput(props: {
@@ -662,7 +1107,7 @@ function Dialogs() {
 											format={false}
 										>
 											<NumberField.Input
-												class="rounded-[0.5rem] bg-gray-2 hover:ring-1 py-[18px] hover:ring-gray-5 h-[2rem] font-normal placeholder:text-black-transparent-40 text-xs caret-gray-500 transition-shadow duration-200 focus:ring-offset-1 focus:bg-gray-3 focus:ring-offset-gray-100 focus:ring-1 focus:ring-gray-10 px-[0.5rem] w-full text-[0.875rem] outline-none text-gray-12"
+												class="rounded-lg bg-gray-2 hover:ring-1 py-[18px] hover:ring-gray-5 h-8 font-normal placeholder:text-black-transparent-40 text-xs caret-gray-500 transition-shadow duration-200 focus:ring-offset-1 focus:bg-gray-3 focus:ring-offset-gray-100 focus:ring-1 focus:ring-gray-10 px-2 w-full text-[0.875rem] outline-hidden text-gray-12"
 												onKeyDown={composeEventHandlers<HTMLInputElement>([
 													(e) => e.stopPropagation(),
 												])}
@@ -674,36 +1119,35 @@ function Dialogs() {
 								return (
 									<>
 										<Dialog.Header>
-											<div class="flex flex-row space-x-[2rem]">
-												<div class="flex flex-row items-center space-x-[0.75rem] text-gray-11">
+											<div class="flex flex-row space-x-8">
+												<div class="flex flex-row items-center space-x-3 text-gray-11">
 													<span>Size</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="width" max={display.width} />
 													</div>
 													<span>×</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="height" max={display.height} />
 													</div>
 												</div>
-												<div class="flex flex-row items-center space-x-[0.75rem] text-gray-11">
+												<div class="flex flex-row items-center space-x-3 text-gray-11">
 													<span>Position</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="x" />
 													</div>
 													<span>×</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="y" />
 													</div>
 												</div>
 											</div>
 											<div class="flex flex-row gap-3 justify-end items-center w-full">
-												<div class="flex flex-row items-center space-x-[0.5rem] text-gray-11"></div>
+												<div class="flex flex-row items-center space-x-2 text-gray-11"></div>
 
 												<Button
 													variant="white"
 													size="xs"
-													class="flex items-center justify-center text-center rounded-full h-[2rem] w-[2rem] border focus:border-blue-9"
-													onMouseDown={showCropOptionsMenu}
+													class="flex items-center justify-center text-center rounded-full h-8 w-8 border focus:border-blue-9"
 													onClick={showCropOptionsMenu}
 												>
 													<div class="relative pointer-events-none size-4">
@@ -712,7 +1156,7 @@ function Dialogs() {
 														</Show>
 														<Transition
 															enterClass="scale-50 opacity-0 blur-md"
-															enterActiveClass="duration-200 [transition-timing-function:cubic-bezier(0.215,0.61,0.355,1)]"
+															enterActiveClass="duration-200 ease-[cubic-bezier(0.215,0.61,0.355,1)]"
 															enterToClass="scale-100 opacity-100 blur-0"
 															exitClass="opacity-0"
 															exitActiveClass="duration-0"
@@ -758,7 +1202,7 @@ function Dialogs() {
 										</Dialog.Header>
 										<Dialog.Content>
 											<div class="flex flex-row justify-center">
-												<div class="rounded divide-black-transparent-10">
+												<div class="rounded-sm divide-black-transparent-10">
 													<Cropper
 														ref={cropperRef}
 														onCropChange={setCrop}
@@ -771,14 +1215,35 @@ function Dialogs() {
 														onContextMenu={(e) => showCropOptionsMenu(e, true)}
 													>
 														<img
-															class="shadow pointer-events-none max-h-[70vh]"
+															class="shadow-sm pointer-events-none max-h-[70vh]"
 															alt="Current frame"
-															src={
-																frameBlobUrl() ??
-																convertFileSrc(
-																	`${editorInstance.path}/screenshots/display.jpg`,
-																)
+															onError={() => {
+																const failedSource = frameSource();
+																logCropProfile("preview-image-failed", {
+																	elapsedMs: Number(
+																		(performance.now() - cropOpenedAt).toFixed(
+																			2,
+																		),
+																	),
+																	source: failedSource,
+																});
+																requestAccurateFrame(
+																	failedSource === "screenshot"
+																		? "screenshot-load-failed"
+																		: "preview-load-failed",
+																);
+															}}
+															onLoad={() =>
+																logCropProfile("preview-image-loaded", {
+																	elapsedMs: Number(
+																		(performance.now() - cropOpenedAt).toFixed(
+																			2,
+																		),
+																	),
+																	source: frameSource(),
+																})
 															}
+															src={frameBlobUrl() ?? screenshotSrc}
 														/>
 													</Cropper>
 												</div>

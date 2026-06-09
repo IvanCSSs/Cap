@@ -1,20 +1,29 @@
 import { promises as fs } from "node:fs";
 import { db } from "@cap/database";
-import { organizations, s3Buckets, users, videos } from "@cap/database/schema";
+import {
+	organizations,
+	users,
+	videos,
+	videoUploads,
+} from "@cap/database/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
-import { S3Buckets } from "@cap/web-backend";
-import type { S3Bucket, Video } from "@cap/web-domain";
+import { Storage } from "@cap/web-backend";
+import {
+	AI_GENERATION_LANGUAGE_AUTO,
+	type AiGenerationLanguage,
+	type AiGenerationLanguageCode,
+	parseAiGenerationLanguage,
+	type Video,
+} from "@cap/web-domain";
 import { createClient } from "@deepgram/sdk";
 import { eq } from "drizzle-orm";
-import { Option } from "effect";
 import { FatalError } from "workflow";
 import {
 	ENHANCED_AUDIO_CONTENT_TYPE,
 	ENHANCED_AUDIO_EXTENSION,
 	enhanceAudioFromUrl,
-	isAudioEnhancementConfigured,
 } from "@/lib/audio-enhance";
 import { checkHasAudioTrack, extractAudioFromUrl } from "@/lib/audio-extract";
 import { startAiGeneration } from "@/lib/generate-ai";
@@ -22,9 +31,11 @@ import {
 	checkHasAudioTrackViaMediaServer,
 	extractAudioViaMediaServer,
 	isMediaServerConfigured,
+	probeVideoViaMediaServer,
 } from "@/lib/media-client";
 import { runPromise } from "@/lib/server";
 import { type DeepgramResult, formatToWebVTT } from "@/lib/transcribe-utils";
+import { decodeStorageVideo } from "@/lib/video-storage";
 
 interface TranscribeWorkflowPayload {
 	videoId: string;
@@ -34,9 +45,9 @@ interface TranscribeWorkflowPayload {
 
 interface VideoData {
 	video: typeof videos.$inferSelect;
-	bucketId: S3Bucket.S3BucketId | null;
 	transcriptionDisabled: boolean;
 	isOwnerPro: boolean;
+	aiGenerationLanguage: AiGenerationLanguage;
 }
 
 export async function transcribeVideoWorkflow(
@@ -53,37 +64,29 @@ export async function transcribeVideoWorkflow(
 		return { success: true, message: "Transcription disabled - skipped" };
 	}
 
-	const audioUrl = await extractAudio(videoId, userId, videoData.bucketId);
+	try {
+		const audioUrl = await extractAudio(videoId, userId, videoData.video);
 
-	if (!audioUrl) {
-		await markNoAudio(videoId);
-		return {
-			success: true,
-			message: "Video has no audio track - skipped transcription",
-		};
+		if (!audioUrl) {
+			await markNoAudio(videoId);
+			return {
+				success: true,
+				message: "Video has no audio track - skipped transcription",
+			};
+		}
+
+		const [transcription] = await Promise.all([
+			transcribeWithDeepgram(audioUrl, videoData.aiGenerationLanguage),
+		]);
+
+		await saveTranscription(videoId, userId, videoData.video, transcription);
+	} catch (error) {
+		await markError(videoId);
+		await cleanupTempAudio(videoId, userId, videoData.video);
+		throw error;
 	}
 
-	// const enhancementConfigured = isAudioEnhancementConfigured();
-	// const shouldEnhanceAudio = videoData.isOwnerPro && enhancementConfigured;
-
-	// console.log(
-	// 	`[transcribe] Audio enhancement check: isOwnerPro=${videoData.isOwnerPro}, configured=${enhancementConfigured}, shouldEnhance=${shouldEnhanceAudio}`,
-	// );
-
-	// if (shouldEnhanceAudio) {
-	// 	await markEnhancedAudioProcessing(videoId);
-	// }
-
-	const [transcription] = await Promise.all([
-		transcribeWithDeepgram(audioUrl),
-		// shouldEnhanceAudio
-		// 	? enhanceAndSaveAudio(videoId, userId, audioUrl, videoData.bucketId)
-		// 	: Promise.resolve(),
-	]);
-
-	await saveTranscription(videoId, userId, videoData.bucketId, transcription);
-
-	await cleanupTempAudio(videoId, userId, videoData.bucketId);
+	await cleanupTempAudio(videoId, userId, videoData.video);
 
 	if (aiGenerationEnabled) {
 		await queueAiGeneration(videoId, userId);
@@ -102,13 +105,11 @@ async function validateVideo(videoId: string): Promise<VideoData> {
 	const query = await db()
 		.select({
 			video: videos,
-			bucket: s3Buckets,
 			settings: videos.settings,
 			orgSettings: organizations.settings,
 			owner: users,
 		})
 		.from(videos)
-		.leftJoin(s3Buckets, eq(videos.bucket, s3Buckets.id))
 		.leftJoin(organizations, eq(videos.orgId, organizations.id))
 		.innerJoin(users, eq(videos.ownerId, users.id))
 		.where(eq(videos.id, videoId as Video.VideoId));
@@ -140,9 +141,11 @@ async function validateVideo(videoId: string): Promise<VideoData> {
 
 	return {
 		video: result.video,
-		bucketId: (result.bucket?.id ?? null) as S3Bucket.S3BucketId | null,
 		transcriptionDisabled,
 		isOwnerPro,
+		aiGenerationLanguage: parseAiGenerationLanguage(
+			result.orgSettings?.aiGenerationLanguage,
+		),
 	};
 }
 
@@ -164,42 +167,67 @@ async function markNoAudio(videoId: string): Promise<void> {
 		.where(eq(videos.id, videoId as Video.VideoId));
 }
 
+async function markError(videoId: string): Promise<void> {
+	"use step";
+
+	await db()
+		.update(videos)
+		.set({ transcriptionStatus: "ERROR" })
+		.where(eq(videos.id, videoId as Video.VideoId));
+}
+
 async function extractAudio(
 	videoId: string,
 	userId: string,
-	bucketId: S3Bucket.S3BucketId | null,
+	video: typeof videos.$inferSelect,
 ): Promise<string | null> {
 	"use step";
 
-	const [bucket] = await S3Buckets.getBucketAccess(
-		Option.fromNullable(bucketId),
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
 	).pipe(runPromise);
 
-	const videoKey = `${userId}/${videoId}/result.mp4`;
-	const videoUrl = await bucket.getSignedObjectUrl(videoKey).pipe(runPromise);
-
-	const response = await fetch(videoUrl, {
-		method: "GET",
-		headers: { range: "bytes=0-0" },
-	});
-	if (!response.ok) {
-		throw new Error("Video file not accessible");
-	}
+	const videoUrl = await resolveVideoSourceUrl(videoId, userId, video);
 
 	const useMediaServer = isMediaServerConfigured();
+	console.log(
+		`[transcribe] Audio detection: useMediaServer=${useMediaServer}, videoId=${videoId}`,
+	);
 
 	let hasAudio: boolean;
 	let audioBuffer: Buffer;
 
 	if (useMediaServer) {
-		hasAudio = await checkHasAudioTrackViaMediaServer(videoUrl);
+		try {
+			const probe = await probeVideoViaMediaServer(videoUrl);
+			console.log(
+				`[transcribe] Probe result for ${videoId}: audioCodec=${probe.audioCodec}, videoCodec=${probe.videoCodec}, duration=${probe.duration}, audioChannels=${probe.audioChannels}, sampleRate=${probe.sampleRate}`,
+			);
+			hasAudio = probe.audioCodec !== null;
+		} catch (probeError) {
+			console.error(
+				`[transcribe] Probe failed for ${videoId}, falling back to audio check:`,
+				probeError,
+			);
+			hasAudio = await checkHasAudioTrackViaMediaServer(videoUrl);
+			console.log(
+				`[transcribe] Fallback audio check result for ${videoId}: hasAudio=${hasAudio}`,
+			);
+		}
+
 		if (!hasAudio) {
+			console.log(
+				`[transcribe] No audio track detected for ${videoId} via media server`,
+			);
 			return null;
 		}
 
 		audioBuffer = await extractAudioViaMediaServer(videoUrl);
 	} else {
 		hasAudio = await checkHasAudioTrack(videoUrl);
+		console.log(
+			`[transcribe] Local ffmpeg audio check for ${videoId}: hasAudio=${hasAudio}`,
+		);
 		if (!hasAudio) {
 			return null;
 		}
@@ -213,6 +241,10 @@ async function extractAudio(
 		}
 	}
 
+	console.log(
+		`[transcribe] Extracted audio for ${videoId}: ${audioBuffer.length} bytes`,
+	);
+
 	const audioKey = `${userId}/${videoId}/audio-temp.mp3`;
 
 	await bucket
@@ -222,13 +254,80 @@ async function extractAudio(
 		.pipe(runPromise);
 
 	const audioSignedUrl = await bucket
-		.getSignedObjectUrl(audioKey)
+		.getInternalSignedObjectUrl(audioKey)
 		.pipe(runPromise);
 
 	return audioSignedUrl;
 }
 
-async function transcribeWithDeepgram(audioUrl: string): Promise<string> {
+async function resolveVideoSourceUrl(
+	videoId: string,
+	userId: string,
+	video: typeof videos.$inferSelect,
+): Promise<string> {
+	const [resolvedBucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
+	).pipe(runPromise);
+
+	const upload = await db()
+		.select({ rawFileKey: videoUploads.rawFileKey })
+		.from(videoUploads)
+		.where(eq(videoUploads.videoId, videoId as Video.VideoId))
+		.limit(1);
+
+	const candidateKeys = [
+		`${userId}/${videoId}/result.mp4`,
+		upload[0]?.rawFileKey,
+	].filter(
+		(value, index, values): value is string =>
+			Boolean(value) && values.indexOf(value) === index,
+	);
+
+	for (const key of candidateKeys) {
+		const url = await resolvedBucket
+			.getInternalSignedObjectUrl(key)
+			.pipe(runPromise);
+		const response = await fetch(url, {
+			method: "GET",
+			headers: { range: "bytes=0-0" },
+		});
+
+		if (response.ok) {
+			console.log(`[transcribe] Using video source ${key}`);
+			return url;
+		}
+	}
+
+	throw new Error("Video file not accessible");
+}
+
+export function getDeepgramTranscriptionOptions(
+	language: AiGenerationLanguage,
+) {
+	const baseOptions = {
+		model: "nova-3",
+		smart_format: true,
+		utterances: true,
+		mime_type: "audio/mpeg",
+	} as const;
+
+	if (language === AI_GENERATION_LANGUAGE_AUTO) {
+		return {
+			...baseOptions,
+			detect_language: [...DEEPGRAM_DETECTABLE_LANGUAGES],
+		};
+	}
+
+	return {
+		...baseOptions,
+		language,
+	};
+}
+
+async function transcribeWithDeepgram(
+	audioUrl: string,
+	language: AiGenerationLanguage,
+): Promise<string> {
 	"use step";
 
 	const audioResponse = await fetch(audioUrl);
@@ -244,32 +343,46 @@ async function transcribeWithDeepgram(audioUrl: string): Promise<string> {
 
 	const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
 		audioBuffer,
-		{
-			model: "nova-3",
-			smart_format: true,
-			detect_language: true,
-			utterances: true,
-			mime_type: "audio/mpeg",
-		},
+		getDeepgramTranscriptionOptions(language),
 	);
 
 	if (error) {
-		throw new Error(`Deepgram transcription failed: ${error.message}`);
+		throw new Error(
+			`Deepgram transcription failed (language=${language}): ${error.message}`,
+		);
 	}
 
 	return formatToWebVTT(result as unknown as DeepgramResult);
 }
 
+const DEEPGRAM_DETECTABLE_LANGUAGES = [
+	"en",
+	"es",
+	"fr",
+	"de",
+	"pt",
+	"it",
+	"nl",
+	"pl",
+	"sk",
+	"ru",
+	"tr",
+	"ja",
+	"ko",
+	"zh",
+	"hi",
+] as const satisfies readonly AiGenerationLanguageCode[];
+
 async function saveTranscription(
 	videoId: string,
 	userId: string,
-	bucketId: S3Bucket.S3BucketId | null,
+	video: typeof videos.$inferSelect,
 	transcription: string,
 ): Promise<void> {
 	"use step";
 
-	const [bucket] = await S3Buckets.getBucketAccess(
-		Option.fromNullable(bucketId),
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
 	).pipe(runPromise);
 
 	await bucket
@@ -287,15 +400,15 @@ async function saveTranscription(
 async function cleanupTempAudio(
 	videoId: string,
 	userId: string,
-	bucketId: S3Bucket.S3BucketId | null,
+	video: typeof videos.$inferSelect,
 ): Promise<void> {
 	"use step";
 
 	const audioKey = `${userId}/${videoId}/audio-temp.mp3`;
 
 	try {
-		const [bucket] = await S3Buckets.getBucketAccess(
-			Option.fromNullable(bucketId),
+		const [bucket] = await Storage.getAccessForVideo(
+			decodeStorageVideo(video),
 		).pipe(runPromise);
 
 		await bucket.deleteObject(audioKey).pipe(runPromise);
@@ -316,7 +429,7 @@ async function queueAiGeneration(
 	await startAiGeneration(videoId as Video.VideoId, userId);
 }
 
-async function markEnhancedAudioProcessing(videoId: string): Promise<void> {
+async function _markEnhancedAudioProcessing(videoId: string): Promise<void> {
 	"use step";
 
 	const [video] = await db()
@@ -337,11 +450,11 @@ async function markEnhancedAudioProcessing(videoId: string): Promise<void> {
 		.where(eq(videos.id, videoId as Video.VideoId));
 }
 
-async function enhanceAndSaveAudio(
+async function _enhanceAndSaveAudio(
 	videoId: string,
 	userId: string,
 	audioUrl: string,
-	bucketId: S3Bucket.S3BucketId | null,
+	video: typeof videos.$inferSelect,
 ): Promise<void> {
 	"use step";
 
@@ -353,8 +466,8 @@ async function enhanceAndSaveAudio(
 			`[transcribe] Audio enhanced, saving to S3 (${enhancedBuffer.length} bytes)`,
 		);
 
-		const [bucket] = await S3Buckets.getBucketAccess(
-			Option.fromNullable(bucketId),
+		const [bucket] = await Storage.getAccessForVideo(
+			decodeStorageVideo(video),
 		).pipe(runPromise);
 
 		const enhancedAudioKey = `${userId}/${videoId}/enhanced-audio.${ENHANCED_AUDIO_EXTENSION}`;
@@ -365,12 +478,12 @@ async function enhanceAndSaveAudio(
 			})
 			.pipe(runPromise);
 
-		const [video] = await db()
+		const [videoRecord] = await db()
 			.select({ metadata: videos.metadata })
 			.from(videos)
 			.where(eq(videos.id, videoId as Video.VideoId));
 
-		const currentMetadata = (video?.metadata as VideoMetadata) || {};
+		const currentMetadata = (videoRecord?.metadata as VideoMetadata) || {};
 
 		await db()
 			.update(videos)

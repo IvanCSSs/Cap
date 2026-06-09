@@ -15,6 +15,12 @@ describe("shouldDeferPlaybackSource", () => {
 			lastUpdated: new Date(),
 			progress: 10,
 		},
+	])("returns true for active upload state %#", (uploadProgress) => {
+		expect(shouldDeferPlaybackSource(uploadProgress as never)).toBe(true);
+	});
+
+	it.each([
+		null,
 		{
 			status: "processing",
 			lastUpdated: new Date(),
@@ -26,12 +32,6 @@ describe("shouldDeferPlaybackSource", () => {
 			lastUpdated: new Date(),
 			progress: 90,
 		},
-	])("returns true for active upload state %#", (uploadProgress) => {
-		expect(shouldDeferPlaybackSource(uploadProgress as never)).toBe(true);
-	});
-
-	it.each([
-		null,
 		{
 			status: "error",
 			lastUpdated: new Date(),
@@ -52,6 +52,7 @@ describe("shouldDeferPlaybackSource", () => {
 					status: "error",
 					lastUpdated: new Date(),
 					errorMessage: "Video processing timed out",
+					hasRawFallback: false,
 				},
 				true,
 			),
@@ -62,6 +63,7 @@ describe("shouldDeferPlaybackSource", () => {
 					status: "error",
 					lastUpdated: new Date(),
 					errorMessage: "Video processing timed out",
+					hasRawFallback: false,
 				},
 				false,
 			),
@@ -84,6 +86,7 @@ describe("shouldDeferPlaybackSource", () => {
 					status: "error",
 					lastUpdated: new Date(),
 					errorMessage: "Video uploaded, but processing could not start.",
+					hasRawFallback: false,
 				},
 				true,
 			),
@@ -94,6 +97,7 @@ describe("shouldDeferPlaybackSource", () => {
 					status: "error",
 					lastUpdated: new Date(),
 					errorMessage: null,
+					hasRawFallback: false,
 				},
 				false,
 			),
@@ -113,7 +117,7 @@ describe("shouldDeferPlaybackSource", () => {
 		);
 	});
 
-	it("reloads playback when upload progress clears before media finishes loading", () => {
+	it("reloads playback when upload progress clears", () => {
 		expect(
 			shouldReloadPlaybackAfterUploadCompletes(
 				{
@@ -122,8 +126,29 @@ describe("shouldDeferPlaybackSource", () => {
 					progress: 80,
 					message: "Finishing video...",
 				},
+				{
+					status: "processing",
+					lastUpdated: new Date(),
+					progress: 90,
+					message: "Still processing...",
+				},
+			),
+		).toBe(false);
+		expect(
+			shouldReloadPlaybackAfterUploadCompletes(
+				{
+					status: "fetching",
+				},
 				null,
-				false,
+			),
+		).toBe(false);
+		expect(
+			shouldReloadPlaybackAfterUploadCompletes(
+				{
+					status: "fetching",
+				},
+				null,
+				{ includeFetching: true },
 			),
 		).toBe(true);
 		expect(
@@ -135,12 +160,9 @@ describe("shouldDeferPlaybackSource", () => {
 					message: "Finishing video...",
 				},
 				null,
-				true,
 			),
-		).toBe(false);
-		expect(shouldReloadPlaybackAfterUploadCompletes(null, null, false)).toBe(
-			false,
-		);
+		).toBe(true);
+		expect(shouldReloadPlaybackAfterUploadCompletes(null, null)).toBe(false);
 	});
 
 	it("detects processing that never actually started", () => {

@@ -34,6 +34,8 @@ pub struct MP4Encoder {
     pause_timestamp: Option<Duration>,
     timestamp_offset: Duration,
     is_writing: bool,
+    session_started: bool,
+    is_finishing: bool,
     is_paused: bool,
     writer_failed: bool,
     video_frames_appended: usize,
@@ -43,6 +45,7 @@ pub struct MP4Encoder {
     last_audio_end_pts: Option<i64>,
     last_audio_timescale: Option<i32>,
     pending_video_frame: Option<PendingVideoFrame>,
+    instant_mode: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -79,6 +82,8 @@ pub enum QueueFrameError {
     Failed,
     #[error("WriterFailed/{0}")]
     WriterFailed(arc::R<ns::Error>),
+    #[error("Finished")]
+    Finished,
     #[error("Construct/{0}")]
     Construct(cidre::os::Error),
     #[error("NotReadyForMore")]
@@ -100,13 +105,60 @@ pub enum FinishError {
 }
 
 impl MP4Encoder {
+    fn effective_video_pts(&self) -> Option<Duration> {
+        let pending_pts = self.pending_video_frame.as_ref().map(|p| p.pts);
+        match (self.last_video_pts, pending_pts) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     pub fn init(
         output: PathBuf,
         video_config: VideoInfo,
         audio_config: Option<AudioInfo>,
         output_height: Option<u32>,
     ) -> Result<Self, InitError> {
-        Self::init_with_options(output, video_config, audio_config, output_height, false)
+        Self::init_with_options(
+            output,
+            video_config,
+            audio_config,
+            output_height,
+            BitrateProfile::Balanced,
+            false,
+        )
+    }
+
+    pub fn init_ultra(
+        output: PathBuf,
+        video_config: VideoInfo,
+        audio_config: Option<AudioInfo>,
+        output_height: Option<u32>,
+    ) -> Result<Self, InitError> {
+        Self::init_with_options(
+            output,
+            video_config,
+            audio_config,
+            output_height,
+            BitrateProfile::Ultra,
+            false,
+        )
+    }
+
+    pub fn init_compatibility(
+        output: PathBuf,
+        video_config: VideoInfo,
+        audio_config: Option<AudioInfo>,
+        output_height: Option<u32>,
+    ) -> Result<Self, InitError> {
+        Self::init_with_options(
+            output,
+            video_config,
+            audio_config,
+            output_height,
+            BitrateProfile::Compatibility,
+            false,
+        )
     }
 
     pub fn init_instant_mode(
@@ -115,7 +167,14 @@ impl MP4Encoder {
         audio_config: Option<AudioInfo>,
         output_height: Option<u32>,
     ) -> Result<Self, InitError> {
-        Self::init_with_options(output, video_config, audio_config, output_height, true)
+        Self::init_with_options(
+            output,
+            video_config,
+            audio_config,
+            output_height,
+            BitrateProfile::Balanced,
+            true,
+        )
     }
 
     fn init_with_options(
@@ -123,8 +182,10 @@ impl MP4Encoder {
         video_config: VideoInfo,
         audio_config: Option<AudioInfo>,
         output_height: Option<u32>,
+        bitrate_profile: BitrateProfile,
         instant_mode: bool,
     ) -> Result<Self, InitError> {
+        let ultra_quality = matches!(bitrate_profile, BitrateProfile::Ultra);
         info!(
             width = video_config.width,
             height = video_config.height,
@@ -215,16 +276,28 @@ impl MP4Encoder {
             let bitrate = if instant_mode {
                 get_instant_mode_bitrate(output_width as f32, output_height as f32, fps)
             } else {
-                get_average_bitrate(output_width as f32, output_height as f32, fps)
+                match bitrate_profile {
+                    BitrateProfile::Ultra => {
+                        get_ultra_bitrate(output_width as f32, output_height as f32, fps)
+                    }
+                    BitrateProfile::Balanced => {
+                        get_average_bitrate(output_width as f32, output_height as f32, fps)
+                    }
+                    BitrateProfile::Compatibility => {
+                        get_compatibility_bitrate(output_width as f32, output_height as f32, fps)
+                    }
+                }
             };
 
-            debug!(instant_mode, "recording bitrate: {bitrate}");
+            debug!(
+                instant_mode,
+                ?bitrate_profile,
+                "recording bitrate: {bitrate}"
+            );
 
-            let keyframe_interval = if instant_mode {
-                fps as i32
-            } else {
-                (fps * 2.0) as i32
-            };
+            let keyframe_interval = keyframe_interval_for_fps(fps);
+
+            let allow_frame_reordering = ultra_quality && !instant_mode;
 
             output_settings.insert(
                 av::video_settings_keys::compression_props(),
@@ -237,7 +310,7 @@ impl MP4Encoder {
                     ],
                     &[
                         ns::Number::with_f32(bitrate).as_id_ref(),
-                        ns::Number::with_bool(false).as_id_ref(),
+                        ns::Number::with_bool(allow_frame_reordering).as_id_ref(),
                         ns::Number::with_f32(fps).as_id_ref(),
                         ns::Number::with_i32(keyframe_interval).as_id_ref(),
                     ],
@@ -365,6 +438,8 @@ impl MP4Encoder {
             pause_timestamp: None,
             timestamp_offset: Duration::ZERO,
             is_writing: false,
+            session_started: false,
+            is_finishing: false,
             is_paused: false,
             writer_failed: false,
             video_frames_appended: 0,
@@ -374,6 +449,7 @@ impl MP4Encoder {
             last_audio_end_pts: None,
             last_audio_timescale: None,
             pending_video_frame: None,
+            instant_mode,
         })
     }
 
@@ -384,6 +460,10 @@ impl MP4Encoder {
     ) -> Result<(), QueueFrameError> {
         if self.writer_failed {
             return Err(QueueFrameError::Failed);
+        }
+
+        if self.is_finishing {
+            return Err(QueueFrameError::Finished);
         }
 
         if self.is_paused {
@@ -415,7 +495,8 @@ impl MP4Encoder {
             }
         }
 
-        if !self.is_writing {
+        if !self.session_started {
+            self.session_started = true;
             self.is_writing = true;
             self.asset_writer
                 .start_session_at_src_time(cm::Time::zero());
@@ -430,8 +511,9 @@ impl MP4Encoder {
             self.pause_timestamp = None;
         }
 
-        if let (Some(audio_end_pts), Some(audio_ts)) =
-            (self.last_audio_end_pts, self.last_audio_timescale)
+        if !self.instant_mode
+            && let (Some(audio_end_pts), Some(audio_ts)) =
+                (self.last_audio_end_pts, self.last_audio_timescale)
         {
             let audio_secs = audio_end_pts as f64 / audio_ts as f64;
             let video_secs = timestamp
@@ -449,14 +531,10 @@ impl MP4Encoder {
 
         let mut deferred_offset: Option<Duration> = None;
 
-        let pending_pts = self.pending_video_frame.as_ref().map(|p| p.pts);
-        let effective_last_pts = match (self.last_video_pts, pending_pts) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+        let effective_last_pts = self.effective_video_pts();
 
         if let Some(last_pts) = effective_last_pts
-            && pts_duration <= last_pts
+            && pts_duration <= last_pts.saturating_add(self.minimum_video_pts_step())
         {
             let frame_duration = self.video_frame_duration();
             let adjusted_pts = last_pts + frame_duration;
@@ -502,10 +580,15 @@ impl MP4Encoder {
             return Err(QueueFrameError::Failed);
         }
 
+        if self.is_finishing {
+            return Err(QueueFrameError::Finished);
+        }
+
         if self.is_paused {
             return Ok(());
         }
 
+        let effective_video_pts = self.effective_video_pts();
         let Some(audio_input) = &mut self.audio_input else {
             return Err(QueueFrameError::NoEncoder);
         };
@@ -517,18 +600,33 @@ impl MP4Encoder {
             self.pause_timestamp = None;
         }
 
-        if !self.is_writing {
+        if !self.session_started {
+            self.session_started = true;
             self.is_writing = true;
             self.asset_writer
                 .start_session_at_src_time(cm::Time::zero());
         }
 
-        if let (Some(audio_end_pts), Some(audio_ts), Some(video_pts)) = (
-            self.last_audio_end_pts,
-            self.last_audio_timescale,
-            self.last_video_pts,
-        ) {
-            let audio_secs = audio_end_pts as f64 / audio_ts as f64;
+        let sample_rate = frame.rate().max(1) as i32;
+        let requested_pts = duration_to_timescale_value(
+            timestamp
+                .checked_sub(self.timestamp_offset)
+                .unwrap_or(Duration::ZERO),
+            sample_rate,
+        );
+        let converted_last_end = match (self.last_audio_end_pts, self.last_audio_timescale) {
+            (Some(end), Some(scale)) if scale == sample_rate => Some(end),
+            (Some(end), Some(scale)) => Some(
+                duration_to_timescale_value(timescale_value_to_duration(end, scale), sample_rate)
+                    .max(end.max(0) + 1),
+            ),
+            _ => None,
+        };
+        let mut pts_value = requested_pts.max(converted_last_end.unwrap_or(0));
+
+        if let Some(video_pts) = effective_video_pts {
+            let candidate_end = pts_value.saturating_add(frame.samples() as i64);
+            let audio_secs = candidate_end as f64 / sample_rate as f64;
             let video_secs = video_pts.as_secs_f64();
             if audio_secs > video_secs + MAX_AV_DRIFT_SECS {
                 return Err(QueueFrameError::NotReadyForMore);
@@ -539,37 +637,53 @@ impl MP4Encoder {
             return Err(QueueFrameError::NotReadyForMore);
         }
 
-        let processed_frame: std::borrow::Cow<'_, frame::Audio> =
-            if let Some(resampler) = &mut self.audio_resampler {
-                let mut resampled = frame::Audio::empty();
-                match resampler.run(frame, &mut resampled) {
-                    Ok(_) => {
-                        resampled.set_rate(self.audio_output_rate);
-                        if resampled.samples() == 0 {
-                            warn!(
-                                input_samples = frame.samples(),
-                                input_rate = frame.rate(),
-                                output_rate = self.audio_output_rate,
-                                "Audio resampling produced 0 samples"
-                            );
-                            return Ok(());
-                        }
-                        std::borrow::Cow::Owned(resampled)
-                    }
-                    Err(e) => {
-                        error!(
-                            error = %e,
+        let processed_frame: std::borrow::Cow<'_, frame::Audio> = if let Some(resampler) =
+            &mut self.audio_resampler
+        {
+            let target = *resampler.output();
+            let src_rate = resampler.input().rate.max(1) as u64;
+            let dst_rate = target.rate.max(1) as u64;
+            let pending_output_samples = resampler
+                .delay()
+                .map(|d| d.output.max(0) as u64)
+                .unwrap_or(0);
+            let resampled_from_input = (frame.samples() as u64)
+                .saturating_mul(dst_rate)
+                .div_ceil(src_rate);
+            let capacity = pending_output_samples
+                .saturating_add(resampled_from_input)
+                .saturating_add(16)
+                .min(i32::MAX as u64) as usize;
+
+            let mut resampled = frame::Audio::new(target.format, capacity, target.channel_layout);
+            match resampler.run(frame, &mut resampled) {
+                Ok(_) => {
+                    resampled.set_rate(self.audio_output_rate);
+                    if resampled.samples() == 0 {
+                        warn!(
                             input_samples = frame.samples(),
                             input_rate = frame.rate(),
                             output_rate = self.audio_output_rate,
-                            "Audio resampling failed"
+                            "Audio resampling produced 0 samples"
                         );
-                        return Err(QueueFrameError::ResamplingFailed(e));
+                        return Ok(());
                     }
+                    std::borrow::Cow::Owned(resampled)
                 }
-            } else {
-                std::borrow::Cow::Borrowed(frame)
-            };
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        input_samples = frame.samples(),
+                        input_rate = frame.rate(),
+                        output_rate = self.audio_output_rate,
+                        "Audio resampling failed"
+                    );
+                    return Err(QueueFrameError::ResamplingFailed(e));
+                }
+            }
+        } else {
+            std::borrow::Cow::Borrowed(frame)
+        };
 
         let frame = processed_frame.as_ref();
 
@@ -612,19 +726,6 @@ impl MP4Encoder {
 
         let format_desc =
             cm::AudioFormatDesc::with_asbd(&audio_desc).map_err(QueueFrameError::Construct)?;
-
-        let sample_rate = frame.rate().max(1) as i32;
-        let mut pts_value = match (self.last_audio_end_pts, self.last_audio_timescale) {
-            (Some(end), Some(scale)) if scale == sample_rate => end,
-            (Some(end), Some(scale)) => {
-                let converted = duration_to_timescale_value(
-                    timescale_value_to_duration(end, scale),
-                    sample_rate,
-                );
-                converted.max(end.max(0) + 1)
-            }
-            _ => 0,
-        };
 
         if let Some(last_end) = self.last_audio_end_pts
             && self.last_audio_timescale == Some(sample_rate)
@@ -698,12 +799,14 @@ impl MP4Encoder {
             dts: cm::Time::invalid(),
         };
 
-        let timed_frame = match pending.raw_frame.copy_with_new_timing(&[timing]) {
+        let timed_frame = match rebuild_video_sample_buf(&pending.raw_frame, timing)
+            .or_else(|_| pending.raw_frame.copy_with_new_timing(&[timing]))
+        {
             Ok(f) => f,
             Err(e) => {
                 warn!(
                     ?e,
-                    "Failed to copy pending sample buffer with new timing, skipping frame"
+                    "Failed to rebuild pending sample buffer with new timing, skipping frame"
                 );
                 return Ok(());
             }
@@ -760,6 +863,11 @@ impl MP4Encoder {
         Duration::from_nanos(nanos as u64)
     }
 
+    fn minimum_video_pts_step(&self) -> Duration {
+        let nanos = (self.video_frame_duration().as_nanos() / 4).max(1);
+        Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+    }
+
     pub fn pause(&mut self) {
         if self.is_paused || !self.is_writing {
             return;
@@ -801,7 +909,7 @@ impl MP4Encoder {
         &mut self,
         timestamp: Option<Duration>,
     ) -> Result<arc::R<av::AssetWriter>, FinishError> {
-        if !self.is_writing {
+        if !self.session_started || self.is_finishing {
             return Err(FinishError::NotWriting);
         }
 
@@ -826,6 +934,7 @@ impl MP4Encoder {
 
         let end_timestamp = finish_timestamp.unwrap_or(last_frame_ts);
 
+        self.is_finishing = true;
         self.is_writing = false;
 
         let mut end_session_time = end_timestamp.saturating_sub(self.timestamp_offset);
@@ -905,10 +1014,35 @@ fn timescale_value_to_duration(value: i64, timescale: i32) -> Duration {
     Duration::from_nanos(nanos)
 }
 
+const MIN_STUDIO_BITRATE: f32 = 8_000_000.0;
+const MAX_ULTRA_BITRATE: f32 = 120_000_000.0;
+const MIN_COMPATIBILITY_BITRATE: f32 = 2_500_000.0;
+const MAX_COMPATIBILITY_BITRATE: f32 = 10_000_000.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum BitrateProfile {
+    Compatibility,
+    #[default]
+    Balanced,
+    Ultra,
+}
+
 fn get_average_bitrate(width: f32, height: f32, fps: f32) -> f32 {
-    5_000_000.0
-        + width * height / (1920.0 * 1080.0) * 2_000_000.0
-        + fps.min(60.0) / 30.0 * 5_000_000.0
+    let pixels = width * height;
+    let fps_factor = fps.min(60.0) / 30.0;
+    (pixels * fps_factor * 5.0).max(MIN_STUDIO_BITRATE)
+}
+
+fn get_ultra_bitrate(width: f32, height: f32, fps: f32) -> f32 {
+    let pixels = width * height;
+    let fps_factor = fps.min(60.0) / 30.0;
+    (pixels * fps_factor * 10.0).clamp(MIN_STUDIO_BITRATE, MAX_ULTRA_BITRATE)
+}
+
+fn get_compatibility_bitrate(width: f32, height: f32, fps: f32) -> f32 {
+    let pixels = width * height;
+    let fps_factor = fps.min(60.0) / 30.0;
+    (pixels * fps_factor * 2.5).clamp(MIN_COMPATIBILITY_BITRATE, MAX_COMPATIBILITY_BITRATE)
 }
 
 fn get_instant_mode_bitrate(width: f32, height: f32, fps: f32) -> f32 {
@@ -917,13 +1051,25 @@ fn get_instant_mode_bitrate(width: f32, height: f32, fps: f32) -> f32 {
     1_500_000.0 + pixel_ratio * 1_500_000.0 + fps_ratio * 500_000.0
 }
 
+fn keyframe_interval_for_fps(fps: f32) -> i32 {
+    (fps * 0.75).floor().max(1.0) as i32
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use cap_media_info::RawVideoFormat;
 
     fn valid_video_config() -> VideoInfo {
         VideoInfo::from_raw(RawVideoFormat::Bgra, 1920, 1080, 30)
+    }
+
+    #[test]
+    fn keyframe_interval_targets_three_quarter_second() {
+        assert_eq!(keyframe_interval_for_fps(30.0), 22);
+        assert_eq!(keyframe_interval_for_fps(60.0), 45);
+        assert_eq!(keyframe_interval_for_fps(1.0), 1);
     }
 
     #[test]
@@ -1139,7 +1285,11 @@ mod tests {
         path
     }
 
-    fn create_pixel_buffer_pool(width: usize, height: usize) -> arc::R<cidre::cv::PixelBufPool> {
+    fn create_pixel_buffer_pool_with_format(
+        width: usize,
+        height: usize,
+        pixel_format: cidre::cv::PixelFormat,
+    ) -> arc::R<cidre::cv::PixelBufPool> {
         use cidre::{cf, cv};
 
         let min_count_num = cf::Number::from_usize(8);
@@ -1158,7 +1308,7 @@ mod tests {
             cv::pixel_buffer::keys::height().as_ref(),
         ];
         let pixel_buf_attr_values: [&cf::Type; 3] = [
-            cv::PixelFormat::_420V.to_cf_number().as_ref(),
+            pixel_format.to_cf_number().as_ref(),
             width_num.as_ref(),
             height_num.as_ref(),
         ];
@@ -1166,6 +1316,10 @@ mod tests {
             cf::Dictionary::with_keys_values(&pixel_buf_attr_keys, &pixel_buf_attr_values).unwrap();
 
         cv::PixelBufPool::new(Some(pool_attrs.as_ref()), Some(pixel_buf_attrs.as_ref())).unwrap()
+    }
+
+    fn create_pixel_buffer_pool(width: usize, height: usize) -> arc::R<cidre::cv::PixelBufPool> {
+        create_pixel_buffer_pool_with_format(width, height, cidre::cv::PixelFormat::_420V)
     }
 
     fn create_test_video_frame(
@@ -1202,6 +1356,68 @@ mod tests {
         frame
     }
 
+    fn run_camera_encoder_scenario(
+        name: &str,
+        video_info: VideoInfo,
+        pool_format: cidre::cv::PixelFormat,
+        frame_timings: &[(i64, i64)],
+    ) -> Result<usize, String> {
+        let output = test_output_path(name);
+        let mut encoder =
+            MP4Encoder::init(output.clone(), video_info, None, None).map_err(|e| e.to_string())?;
+        let pool = create_pixel_buffer_pool_with_format(
+            video_info.width as usize,
+            video_info.height as usize,
+            pool_format,
+        );
+
+        let mut appended = 0usize;
+
+        for &(pts_us, duration_us) in frame_timings {
+            let frame = create_test_video_frame(&pool, pts_us, duration_us);
+            let timestamp = Duration::from_micros(pts_us.max(0) as u64);
+
+            match encoder.queue_video_frame(frame, timestamp) {
+                Ok(()) => appended += 1,
+                Err(QueueFrameError::NotReadyForMore) => {}
+                Err(QueueFrameError::WriterFailed(err)) => {
+                    let _ = std::fs::remove_file(&output);
+                    return Err(format!(
+                        "WriterFailed after {appended} frames at pts={pts_us}us: {err}"
+                    ));
+                }
+                Err(QueueFrameError::Failed) => {
+                    let _ = std::fs::remove_file(&output);
+                    return Err(format!("Failed after {appended} frames at pts={pts_us}us"));
+                }
+                Err(QueueFrameError::Finished) => {
+                    let _ = std::fs::remove_file(&output);
+                    return Err(format!(
+                        "Finished after {appended} frames at pts={pts_us}us"
+                    ));
+                }
+                Err(err) => {
+                    let _ = std::fs::remove_file(&output);
+                    return Err(format!(
+                        "Error after {appended} frames at pts={pts_us}us: {err}"
+                    ));
+                }
+            }
+        }
+
+        let end_pts_us = frame_timings
+            .last()
+            .map(|(pts, dur)| pts + dur)
+            .unwrap_or(1_000_000);
+        encoder
+            .finish(Some(Duration::from_micros(end_pts_us.max(0) as u64)))
+            .map_err(|e| e.to_string())?;
+
+        let _ = std::fs::remove_file(&output);
+
+        Ok(appended)
+    }
+
     fn wireless_audio_config() -> cap_media_info::AudioInfo {
         cap_media_info::AudioInfo {
             sample_rate: 48000,
@@ -1210,6 +1426,17 @@ mod tests {
             time_base: ffmpeg::util::rational::Rational(1, 48000),
             buffer_size: 3840,
             is_wireless_transport: true,
+        }
+    }
+
+    fn wired_audio_config(buffer_size: u32) -> cap_media_info::AudioInfo {
+        cap_media_info::AudioInfo {
+            sample_rate: 48000,
+            channels: 1,
+            sample_format: ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
+            time_base: ffmpeg::util::rational::Rational(1, 48000),
+            buffer_size,
+            is_wireless_transport: false,
         }
     }
 
@@ -1295,11 +1522,15 @@ mod tests {
                                     std::thread::sleep(Duration::from_micros(500));
                                 }
                                 Err(QueueFrameError::WriterFailed(err)) => {
-                                    errors.push(format!("WriterFailed at ts={:?}: {err}", ts));
+                                    errors.push(format!("WriterFailed at ts={ts:?}: {err}"));
                                     break;
                                 }
                                 Err(QueueFrameError::Failed) => {
-                                    errors.push(format!("Failed at ts={:?}", ts));
+                                    errors.push(format!("Failed at ts={ts:?}"));
+                                    break;
+                                }
+                                Err(QueueFrameError::Finished) => {
+                                    errors.push(format!("Finished at ts={ts:?}"));
                                     break;
                                 }
                                 Err(e) => {
@@ -1372,6 +1603,10 @@ mod tests {
                                 }
                                 Err(QueueFrameError::Failed) => {
                                     errors.push(format!("Audio Failed at frame {i}"));
+                                    break;
+                                }
+                                Err(QueueFrameError::Finished) => {
+                                    errors.push(format!("Audio Finished at frame {i}"));
                                     break;
                                 }
                                 Err(e) => {
@@ -1461,13 +1696,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video encoding errors: {:?} (appended={v_appended}, dropped={v_dropped})",
-            v_errors
+            "Video encoding errors: {v_errors:?} (appended={v_appended}, dropped={v_dropped})"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio encoding errors: {:?} (appended={a_appended}, dropped={a_dropped})",
-            a_errors
+            "Audio encoding errors: {a_errors:?} (appended={a_appended}, dropped={a_dropped})"
         );
 
         assert!(
@@ -1537,13 +1770,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors during clock drift: {:?}",
-            v_errors
+            "Video errors during clock drift: {v_errors:?}"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio errors during clock drift: {:?}",
-            a_errors
+            "Audio errors during clock drift: {a_errors:?}"
         );
         assert!(v_appended >= total_video_frames / 2);
         assert!(a_appended >= total_audio_frames / 2);
@@ -1621,13 +1852,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors with frame drops: {:?} (appended={v_appended}, dropped={v_dropped})",
-            v_errors
+            "Video errors with frame drops: {v_errors:?} (appended={v_appended}, dropped={v_dropped})"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio errors with frame drops: {:?}",
-            a_errors
+            "Audio errors with frame drops: {a_errors:?}"
         );
         assert!(
             v_appended >= video_timestamps.len() as u64 / 2,
@@ -1695,10 +1924,9 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors with backward timestamps: {:?}",
-            v_errors
+            "Video errors with backward timestamps: {v_errors:?}"
         );
-        assert!(a_errors.is_empty(), "Audio errors: {:?}", a_errors);
+        assert!(a_errors.is_empty(), "Audio errors: {a_errors:?}");
         assert!(v_appended >= 50);
         assert!(a_appended >= 20);
 
@@ -1713,8 +1941,8 @@ mod tests {
     }
 
     #[test]
-    fn video_ahead_of_audio_throttled() {
-        let output = test_output_path("video_ahead_audio");
+    fn instant_mode_video_advances_past_drift_threshold() {
+        let output = test_output_path("instant_video_past_drift");
         let video = valid_video_config();
         let audio = wireless_audio_config();
 
@@ -1728,24 +1956,78 @@ mod tests {
             .queue_audio_frame(&first_audio, Duration::ZERO)
             .unwrap();
 
-        let mut throttled_count = 0u64;
+        let mut accepted_past_threshold = 0u64;
+        let threshold_ms = (MAX_AV_DRIFT_SECS * 1000.0) as u64 + 500;
+
+        for i in 0..60u64 {
+            let ts_ms = i * 100;
+            let timestamp = Duration::from_millis(ts_ms);
+            let frame = create_test_video_frame(&pool, (ts_ms as i64) * 1000, 100_000);
+
+            let mut retries = 0u32;
+            loop {
+                let result = encoder.queue_video_frame(frame.clone(), timestamp);
+                match result {
+                    Ok(()) => {
+                        if ts_ms > threshold_ms {
+                            accepted_past_threshold += 1;
+                        }
+                        break;
+                    }
+                    Err(QueueFrameError::NotReadyForMore) => {
+                        retries += 1;
+                        if retries > 50 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("Video encode failed at frame {i}: {e}"),
+                }
+            }
+        }
+
+        assert!(
+            accepted_past_threshold > 0,
+            "Instant mode: video frames must be accepted past the {MAX_AV_DRIFT_SECS}s drift threshold"
+        );
+
+        let _ = encoder.finish(Some(Duration::from_secs(7)));
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn non_instant_mode_video_throttled_by_audio_drift() {
+        let output = test_output_path("non_instant_video_throttled");
+        let video = valid_video_config();
+        let audio = wireless_audio_config();
+
+        let mut encoder = MP4Encoder::init(output.clone(), video, Some(audio), None).unwrap();
+
+        let pool = create_pixel_buffer_pool(1920, 1080);
+
+        let first_audio = create_test_audio_frame(48000, 1024);
+        encoder
+            .queue_audio_frame(&first_audio, Duration::ZERO)
+            .unwrap();
+
+        let mut accepted_past_threshold = 0u64;
+        let threshold_ms = (MAX_AV_DRIFT_SECS * 1000.0) as u64 + 500;
+
         for i in 0..200u64 {
             let ts_ms = i * 33;
             let timestamp = Duration::from_millis(ts_ms);
             let frame = create_test_video_frame(&pool, (ts_ms as i64) * 1000, 33_333);
 
-            match encoder.queue_video_frame(frame, timestamp) {
-                Ok(()) => {}
-                Err(QueueFrameError::NotReadyForMore) => {
-                    throttled_count += 1;
-                }
-                Err(e) => panic!("Video encode failed at frame {i}: {e}"),
+            if let Ok(()) = encoder.queue_video_frame(frame, timestamp)
+                && ts_ms > threshold_ms
+            {
+                accepted_past_threshold += 1;
             }
         }
 
-        assert!(
-            throttled_count > 0,
-            "Expected video frames to be throttled when ahead of audio"
+        assert_eq!(
+            accepted_past_threshold, 0,
+            "Non-instant mode: no video frames should be accepted past the {MAX_AV_DRIFT_SECS}s drift threshold"
         );
 
         let _ = encoder.finish(Some(Duration::from_secs(7)));
@@ -1782,16 +2064,8 @@ mod tests {
         let (v_appended, _, v_errors) = video_handle.join().unwrap();
         let (_a_appended, _, a_errors) = audio_handle.join().unwrap();
 
-        assert!(
-            v_errors.is_empty(),
-            "Video errors after gap: {:?}",
-            v_errors
-        );
-        assert!(
-            a_errors.is_empty(),
-            "Audio errors after gap: {:?}",
-            a_errors
-        );
+        assert!(v_errors.is_empty(), "Video errors after gap: {v_errors:?}");
+        assert!(a_errors.is_empty(), "Audio errors after gap: {a_errors:?}");
         assert!(v_appended >= 30);
 
         let result = harness
@@ -1856,7 +2130,7 @@ mod tests {
                         cidre::ns::Number::with_f32(bitrate).as_id_ref(),
                         cidre::ns::Number::with_bool(false).as_id_ref(),
                         cidre::ns::Number::with_f32(fps).as_id_ref(),
-                        cidre::ns::Number::with_i32(fps as i32).as_id_ref(),
+                        cidre::ns::Number::with_i32(keyframe_interval_for_fps(fps)).as_id_ref(),
                     ],
                 )
                 .as_id_ref(),
@@ -1949,6 +2223,13 @@ mod tests {
                             writer_status_name(&asset_writer)
                         ));
                     }
+                    Err(QueueFrameError::Finished) => {
+                        return Err(format!(
+                            "Finished after {appended} frames at pts={pts_us}us \
+                             (writer status: {})",
+                            writer_status_name(&asset_writer)
+                        ));
+                    }
                     Err(e) => {
                         return Err(format!("Error after {appended} frames: {e}"));
                     }
@@ -2025,27 +2306,25 @@ mod tests {
                 let mut pts_duration = timestamp.checked_sub(off).unwrap_or(Duration::ZERO);
 
                 let mut deferred: Option<Duration> = None;
-                if let Some(last_pts) = lv {
-                    if pts_duration <= last_pts {
-                        let adjusted = last_pts + frame_dur;
-                        let new_off = timestamp.checked_sub(adjusted);
-                        if defer_offset {
-                            deferred = new_off;
-                        } else if let Some(o) = new_off {
-                            off = o;
-                        }
-                        pts_duration = adjusted;
+                if let Some(last_pts) = lv
+                    && pts_duration <= last_pts
+                {
+                    let adjusted = last_pts + frame_dur;
+                    let new_off = timestamp.checked_sub(adjusted);
+                    if defer_offset {
+                        deferred = new_off;
+                    } else if let Some(o) = new_off {
+                        off = o;
                     }
+                    pts_duration = adjusted;
                 }
 
                 let pts_us = pts_duration.as_micros() as i64;
                 let appended = i != fail_at_index;
 
                 if appended {
-                    if defer_offset {
-                        if let Some(o) = deferred {
-                            off = o;
-                        }
+                    if defer_offset && let Some(o) = deferred {
+                        off = o;
                     }
                     lv = Some(pts_duration);
                 }
@@ -2072,17 +2351,14 @@ mod tests {
         for w in new_appended.windows(2) {
             assert!(
                 w[1] > w[0],
-                "NEW behavior must produce monotonic PTS: {:?}",
-                new_appended
+                "NEW behavior must produce monotonic PTS: {new_appended:?}"
             );
         }
 
         assert!(
             old_appended != new_appended,
             "Old and new should produce different PTS after failed append with offset. \
-             Old: {:?}, New: {:?}",
-            old_appended,
-            new_appended
+             Old: {old_appended:?}, New: {new_appended:?}"
         );
 
         let old_jump = old_appended[5] - old_appended[4];
@@ -2167,7 +2443,7 @@ mod tests {
                         cidre::ns::Number::with_f32(bitrate).as_id_ref(),
                         cidre::ns::Number::with_bool(false).as_id_ref(),
                         cidre::ns::Number::with_f32(fps).as_id_ref(),
-                        cidre::ns::Number::with_i32(fps as i32).as_id_ref(),
+                        cidre::ns::Number::with_i32(keyframe_interval_for_fps(fps)).as_id_ref(),
                     ],
                 )
                 .as_id_ref(),
@@ -2246,6 +2522,15 @@ mod tests {
                             ),
                         ));
                     }
+                    Err(QueueFrameError::Finished) => {
+                        return Err((
+                            appended,
+                            format!(
+                                "Finished at pts={pts_us}us after {appended} frames (status: {})",
+                                writer_status_name(asset_writer)
+                            ),
+                        ));
+                    }
                     Err(e) => {
                         return Err((appended, format!("Error at pts={pts_us}us: {e}")));
                     }
@@ -2317,6 +2602,130 @@ mod tests {
             "Duplicate PTS should cause AVAssetWriter to fail with -16364. \
              Result: {result:?}"
         );
+    }
+
+    #[test]
+    fn raw_uyvy_camera_sample_bufs_do_not_fail_writer() {
+        let output = test_output_path("uyvy_camera_ok");
+
+        let (mut asset_writer, mut video_input) =
+            setup_raw_writer(&output, 1920, 1080, 60.0, true).unwrap();
+        let pool = create_pixel_buffer_pool_with_format(1920, 1080, cidre::cv::PixelFormat::_2VUY);
+
+        let timings: Vec<(i64, i64)> = (0..120i64).map(|i| (i * 16_666, 16_666)).collect();
+
+        let result = feed_frames_to_writer(&mut video_input, &asset_writer, &pool, &timings, 0);
+
+        let finish = finish_raw_writer(&mut video_input, &mut asset_writer, 120 * 16_666);
+
+        let _ = std::fs::remove_file(&output);
+
+        assert!(
+            result.is_ok() && finish.is_ok(),
+            "Raw UYVY camera sample buffers should append successfully. result={result:?} finish={finish:?}"
+        );
+    }
+
+    #[test]
+    fn camera_writer_scenario_matrix_1080p_uyvy() {
+        let video_60 = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::UYVY422, 1920, 1080, 60);
+        let frame_60 = 16_666i64;
+        let frame_30 = 33_333i64;
+
+        let clean_60: Vec<(i64, i64)> = (0..240i64).map(|i| (i * frame_60, frame_60)).collect();
+
+        let two_backward_anomalies_60: Vec<(i64, i64)> = (0..240i64)
+            .scan(0i64, |pts, i| {
+                let current = *pts;
+                let step = match i {
+                    4 => frame_60 - 49_000,
+                    5 => frame_60 - 14_000,
+                    _ => frame_60,
+                };
+                *pts = (*pts + step).max(0);
+                Some((current, frame_60))
+            })
+            .collect();
+
+        let bursty_60: Vec<(i64, i64)> = (0..240i64)
+            .scan(0i64, |pts, i| {
+                let current = *pts;
+                let step = match i % 12 {
+                    0..=2 => 8_333,
+                    3 => 33_333,
+                    4..=6 => 12_000,
+                    _ => frame_60,
+                };
+                *pts += step;
+                Some((current, frame_60))
+            })
+            .collect();
+
+        let duplicates_60: Vec<(i64, i64)> = (0..240i64)
+            .map(|i| {
+                let pts = if i == 60 || i == 61 {
+                    60 * frame_60
+                } else {
+                    i * frame_60
+                };
+                (pts, frame_60)
+            })
+            .collect();
+
+        let video_30 = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::UYVY422, 1920, 1080, 30);
+        let camera_overlay_like_30: Vec<(i64, i64)> = (0..180i64)
+            .scan(0i64, |pts, i| {
+                let current = *pts;
+                let step = match i % 10 {
+                    0 => 16_666,
+                    1 => 50_000,
+                    5 => 20_000,
+                    _ => frame_30,
+                };
+                *pts += step;
+                Some((current, frame_30))
+            })
+            .collect();
+
+        let scenarios = vec![
+            ("cam_clean_1080p60_uyvy", video_60, clean_60, true),
+            (
+                "cam_two_backward_1080p60_uyvy",
+                video_60,
+                two_backward_anomalies_60,
+                true,
+            ),
+            ("cam_bursty_1080p60_uyvy", video_60, bursty_60, true),
+            (
+                "cam_duplicate_pts_1080p60_uyvy",
+                video_60,
+                duplicates_60,
+                true,
+            ),
+            (
+                "cam_overlay_like_1080p30_uyvy",
+                video_30,
+                camera_overlay_like_30,
+                true,
+            ),
+        ];
+
+        for (name, video_info, timings, should_succeed) in scenarios {
+            let result = run_camera_encoder_scenario(
+                name,
+                video_info,
+                cidre::cv::PixelFormat::_2VUY,
+                &timings,
+            );
+            if should_succeed {
+                assert!(result.is_ok(), "{name} should succeed, got {result:?}");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{name} should fail to reproduce writer rejection"
+                );
+            }
+        }
     }
 
     fn generate_drift_timings(
@@ -2614,6 +3023,10 @@ mod tests {
                     post_jump_errors.push(format!("Failed at frame {i}"));
                     break;
                 }
+                Err(QueueFrameError::Finished) => {
+                    post_jump_errors.push(format!("Finished at frame {i}"));
+                    break;
+                }
                 Err(QueueFrameError::NotReadyForMore) => {}
                 Err(e) => {
                     post_jump_errors.push(format!("Error at frame {i}: {e}"));
@@ -2631,8 +3044,7 @@ mod tests {
 
         assert!(
             post_jump_errors.is_empty(),
-            "Post-jump video frames should succeed (drift guard or recovery): {:?}",
-            post_jump_errors
+            "Post-jump video frames should succeed (drift guard or recovery): {post_jump_errors:?}"
         );
     }
 
@@ -2680,13 +3092,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors in max throughput: {:?}",
-            v_errors
+            "Video errors in max throughput: {v_errors:?}"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio errors in max throughput: {:?}",
-            a_errors
+            "Audio errors in max throughput: {a_errors:?}"
         );
 
         let result = harness
@@ -2766,13 +3176,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors in AV interleave stress: {:?}",
-            v_errors
+            "Video errors in AV interleave stress: {v_errors:?}"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio errors in AV interleave stress: {:?}",
-            a_errors
+            "Audio errors in AV interleave stress: {a_errors:?}"
         );
 
         assert!(v_appended >= total_video_frames / 3);
@@ -2869,13 +3277,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video encoding errors in 65s test: {:?} (appended={v_appended}, dropped={v_dropped})",
-            v_errors
+            "Video encoding errors in 65s test: {v_errors:?} (appended={v_appended}, dropped={v_dropped})"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio encoding errors in 65s test: {:?} (appended={a_appended}, dropped={a_dropped})",
-            a_errors
+            "Audio encoding errors in 65s test: {a_errors:?} (appended={a_appended}, dropped={a_dropped})"
         );
 
         assert!(
@@ -2987,13 +3393,11 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors in user-scenario test: {:?} (appended={v_appended}, dropped={v_dropped})",
-            v_errors
+            "Video errors in user-scenario test: {v_errors:?} (appended={v_appended}, dropped={v_dropped})"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio errors in user-scenario test: {:?} (appended={a_appended}, dropped={a_dropped})",
-            a_errors
+            "Audio errors in user-scenario test: {a_errors:?} (appended={a_appended}, dropped={a_dropped})"
         );
 
         assert!(
@@ -3048,6 +3452,10 @@ mod tests {
                         errors.push(format!("Failed at sandwich frame {frame_idx}"));
                         break;
                     }
+                    Err(QueueFrameError::Finished) => {
+                        errors.push(format!("Finished at sandwich frame {frame_idx}"));
+                        break;
+                    }
                     Err(_) => {}
                 }
             }
@@ -3065,10 +3473,14 @@ mod tests {
                     errors.push(format!("Failed at frame {frame_idx}"));
                     break;
                 }
+                Err(QueueFrameError::Finished) => {
+                    errors.push(format!("Finished at frame {frame_idx}"));
+                    break;
+                }
                 Err(_) => {}
             }
 
-            if frame_idx % 4 == 0 {
+            if frame_idx.is_multiple_of(4) {
                 let audio_frame = create_test_audio_frame(48000, 3840);
                 let _ = encoder.queue_audio_frame(&audio_frame, ts);
             }
@@ -3078,11 +3490,97 @@ mod tests {
 
         assert!(
             errors.is_empty(),
-            "Sandwich PTS frames should not trigger -16364: {:?}",
-            errors
+            "Sandwich PTS frames should not trigger -16364: {errors:?}"
         );
 
         let _ = encoder.finish(Some(Duration::from_secs(15)));
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn regression_tiny_positive_pts_step_is_expanded() {
+        let output = test_output_path("tiny_positive_pts_step");
+        let video = valid_video_config();
+
+        let mut encoder = MP4Encoder::init(output.clone(), video, None, None).unwrap();
+        let pool = create_pixel_buffer_pool(1920, 1080);
+
+        let timestamps = [0u64, 33_333, 33_334, 66_666, 100_000, 133_333];
+        let mut errors = Vec::new();
+
+        for ts_us in timestamps {
+            let frame = create_test_video_frame(&pool, ts_us as i64, 33_333);
+            match encoder.queue_video_frame(frame, Duration::from_micros(ts_us)) {
+                Ok(()) => {}
+                Err(QueueFrameError::WriterFailed(e)) => {
+                    errors.push(format!("WriterFailed at {ts_us}: {e}"));
+                    break;
+                }
+                Err(QueueFrameError::Failed) => {
+                    errors.push(format!("Failed at {ts_us}"));
+                    break;
+                }
+                Err(QueueFrameError::Finished) => {
+                    errors.push(format!("Finished at {ts_us}"));
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "Tiny positive PTS steps should not reach AVFoundation: {errors:?}"
+        );
+
+        let result = encoder.finish(Some(Duration::from_micros(166_666)));
+        assert!(result.is_ok(), "Finish failed: {result:?}");
+
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn regression_wired_mic_timestamp_gap_is_preserved() {
+        let output = test_output_path("wired_mic_timestamp_gap");
+        let video = valid_video_config();
+        let audio = wired_audio_config(1680);
+
+        let mut encoder =
+            MP4Encoder::init_instant_mode(output.clone(), video, Some(audio), None).unwrap();
+
+        let pool = create_pixel_buffer_pool(1920, 1080);
+        let frame_a = create_test_video_frame(&pool, 0, 33_333);
+        let frame_b = create_test_video_frame(&pool, 33_333, 33_333);
+        let frame_c = create_test_video_frame(&pool, 66_666, 33_333);
+        encoder.queue_video_frame(frame_a, Duration::ZERO).unwrap();
+        encoder
+            .queue_video_frame(frame_b, Duration::from_micros(33_333))
+            .unwrap();
+        encoder
+            .queue_video_frame(frame_c, Duration::from_micros(66_666))
+            .unwrap();
+
+        let audio_frame = create_test_audio_frame(48000, 1680);
+        encoder
+            .queue_audio_frame(&audio_frame, Duration::ZERO)
+            .unwrap();
+        assert_eq!(encoder.last_audio_end_pts, Some(1680));
+
+        let gap_timestamp =
+            Duration::from_nanos((3360u128 * 1_000_000_000u128 / 48_000u128) as u64);
+        encoder
+            .queue_audio_frame(&audio_frame, gap_timestamp)
+            .unwrap();
+
+        assert_eq!(
+            encoder.last_audio_end_pts,
+            Some(5040),
+            "audio timeline should preserve a missing 1680-sample chunk"
+        );
+
+        let result = encoder.finish(Some(Duration::from_micros(120_000)));
+        assert!(result.is_ok(), "Finish failed: {result:?}");
+
         let _ = std::fs::remove_file(&output);
     }
 
@@ -3157,15 +3655,13 @@ mod tests {
 
         assert!(
             v_errors.is_empty(),
-            "Video errors in repeated sandwich 65s test: {:?} \
-             (appended={v_appended}, dropped={v_dropped})",
-            v_errors
+            "Video errors in repeated sandwich 65s test: {v_errors:?} \
+             (appended={v_appended}, dropped={v_dropped})"
         );
         assert!(
             a_errors.is_empty(),
-            "Audio errors in repeated sandwich 65s test: {:?} \
-             (appended={a_appended}, dropped={a_dropped})",
-            a_errors
+            "Audio errors in repeated sandwich 65s test: {a_errors:?} \
+             (appended={a_appended}, dropped={a_dropped})"
         );
 
         assert!(
@@ -3209,7 +3705,9 @@ mod tests {
             assert!(
                 !matches!(
                     result,
-                    Err(QueueFrameError::WriterFailed(_)) | Err(QueueFrameError::Failed)
+                    Err(QueueFrameError::WriterFailed(_))
+                        | Err(QueueFrameError::Failed)
+                        | Err(QueueFrameError::Finished)
                 ),
                 "Should not fail during normal encoding at frame {i}: {result:?}"
             );
@@ -3227,6 +3725,39 @@ mod tests {
         );
 
         let _ = encoder.finish(Some(Duration::from_secs(2)));
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn late_frames_after_finish_are_rejected() {
+        let output = test_output_path("late_frames_after_finish");
+        let video = valid_video_config();
+        let audio = wireless_audio_config();
+
+        let mut encoder =
+            MP4Encoder::init_instant_mode(output.clone(), video, Some(audio), None).unwrap();
+
+        let pool = create_pixel_buffer_pool(1920, 1080);
+        let frame = create_test_video_frame(&pool, 0, 33_333);
+        encoder.queue_video_frame(frame, Duration::ZERO).unwrap();
+
+        let finish_result = encoder.finish(Some(Duration::from_secs(1)));
+        assert!(finish_result.is_ok(), "Finish failed: {finish_result:?}");
+
+        let late_audio = create_test_audio_frame(48000, 3840);
+        let late_audio_result = encoder.queue_audio_frame(&late_audio, Duration::from_millis(80));
+        assert!(
+            matches!(late_audio_result, Err(QueueFrameError::Finished)),
+            "Late audio frame should be rejected after finish, got: {late_audio_result:?}"
+        );
+
+        let late_video = create_test_video_frame(&pool, 80_000, 33_333);
+        let late_video_result = encoder.queue_video_frame(late_video, Duration::from_millis(80));
+        assert!(
+            matches!(late_video_result, Err(QueueFrameError::Finished)),
+            "Late video frame should be rejected after finish, got: {late_video_result:?}"
+        );
+
         let _ = std::fs::remove_file(&output);
     }
 }
@@ -3301,6 +3832,25 @@ impl SampleBufExt for cm::SampleBuf {
                 )
             })
         }
+    }
+}
+
+fn rebuild_video_sample_buf(
+    frame: &cm::SampleBuf,
+    timing: SampleTimingInfo,
+) -> os::Result<arc::R<cm::SampleBuf>> {
+    if let Some(image_buf) = frame.image_buf() {
+        let format_desc = cm::VideoFormatDesc::with_image_buf(image_buf)?;
+        cm::SampleBuf::with_image_buf(
+            image_buf,
+            true,
+            None,
+            std::ptr::null(),
+            &format_desc,
+            &timing,
+        )
+    } else {
+        frame.copy_with_new_timing(&[timing])
     }
 }
 

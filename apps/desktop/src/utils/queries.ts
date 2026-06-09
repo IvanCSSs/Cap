@@ -178,8 +178,23 @@ export function createOptionsQuery() {
 
 	recordingSettingsStore.get().then((data) => {
 		batch(() => {
+			if (data?.target) {
+				_setState("captureTarget", data.target);
+			}
+			if (data?.micName !== undefined) {
+				_setState("micName", data.micName);
+			}
+			if (data?.cameraId !== undefined) {
+				_setState("cameraID", data.cameraId);
+			}
 			if (data?.mode && data.mode !== _state.mode) {
 				_setState("mode", data.mode);
+			}
+			if (data?.systemAudio !== undefined) {
+				_setState("captureSystemAudio", data.systemAudio);
+			}
+			if (data?.organizationId !== undefined) {
+				_setState("organizationId", data.organizationId);
 			}
 			initialized = true;
 		});
@@ -272,7 +287,11 @@ export function createCameraMutation() {
 							? e.message
 							: String(e);
 
-				if (message.includes("DeviceNotFound")) {
+				if (
+					message.includes("DeviceNotFound") ||
+					message.includes("CameraTimeout") ||
+					message.includes("Failed to initialize camera")
+				) {
 					setOptions("cameraID", null);
 					console.warn("Selected camera is unavailable.");
 					return;
@@ -332,12 +351,9 @@ export function createCustomDomainQuery() {
 export function createOrganizationsQuery() {
 	const auth = authStore.createQuery();
 
-	// Refresh organizations if they're missing
+	// Bootstrap only: auth.rs stamps organizations_updated_at even on org-fetch failure, stopping the loop on self-hosted where the endpoint is absent.
 	createEffect(() => {
-		if (
-			auth.data?.user_id &&
-			(!auth.data?.organizations || auth.data.organizations.length === 0)
-		) {
+		if (auth.data?.user_id && !auth.data?.organizations_updated_at) {
 			commands.updateAuthPlan().catch(console.error);
 		}
 	});

@@ -19,6 +19,9 @@ use super::frame_converter::{copy_bgra_to_rgba, copy_rgba_plane};
 use super::multi_position::{DecoderPoolManager, MultiPositionDecoderConfig, ScrubDetector};
 use super::{DecoderInitResult, DecoderType, FRAME_CACHE_SIZE, VideoDecoderMessage, pts_to_frame};
 
+const MAX_RELAXED_FALLBACK_DISTANCE: u32 = 8;
+const SCRUB_REUSE_THRESHOLD_SECS: f32 = 0.5;
+
 #[derive(Clone)]
 struct FrameData {
     data: Arc<Vec<u8>>,
@@ -496,16 +499,28 @@ impl AVAssetReaderDecoder {
         })
     }
 
-    fn select_best_decoder(&mut self, requested_time: f32) -> (usize, bool) {
-        let (best_id, _distance, needs_reset) =
-            self.pool_manager.find_best_decoder_for_time(requested_time);
+    fn select_best_decoder(&mut self, requested_time: f32, is_scrubbing: bool) -> (usize, bool) {
+        let decoder_count = self.decoders.len();
+        let (best_id, _distance, needs_reset) = if is_scrubbing {
+            self.pool_manager
+                .find_best_decoder_for_time_with_reuse_threshold(
+                    requested_time,
+                    decoder_count,
+                    SCRUB_REUSE_THRESHOLD_SECS,
+                )
+        } else {
+            self.pool_manager
+                .find_best_decoder_for_time(requested_time, decoder_count)
+        };
 
-        let decoder_idx = best_id.min(self.decoders.len().saturating_sub(1));
+        let decoder_idx = best_id.min(decoder_count.saturating_sub(1));
 
         if needs_reset && decoder_idx < self.decoders.len() {
             self.decoders[decoder_idx].reset(requested_time);
-            self.pool_manager
-                .update_decoder_position(best_id, self.decoders[decoder_idx].current_position());
+            self.pool_manager.update_decoder_position(
+                decoder_idx,
+                self.decoders[decoder_idx].current_position(),
+            );
         }
 
         self.active_decoder_idx = decoder_idx;
@@ -561,6 +576,7 @@ impl AVAssetReaderDecoder {
 
         struct PendingRequest {
             frame: u32,
+            max_fallback_distance: u32,
             sender: oneshot::Sender<DecodedFrame>,
         }
 
@@ -568,20 +584,32 @@ impl AVAssetReaderDecoder {
             let mut pending_requests: Vec<PendingRequest> = Vec::with_capacity(8);
 
             match r {
-                VideoDecoderMessage::GetFrame(requested_time, sender) => {
+                VideoDecoderMessage::GetFrame(requested_time, max_fallback_distance, sender) => {
                     let frame = (requested_time * fps as f32).floor() as u32;
                     if !sender.is_closed() {
-                        pending_requests.push(PendingRequest { frame, sender });
+                        pending_requests.push(PendingRequest {
+                            frame,
+                            max_fallback_distance,
+                            sender,
+                        });
                     }
                 }
             }
 
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    VideoDecoderMessage::GetFrame(requested_time, sender) => {
+                    VideoDecoderMessage::GetFrame(
+                        requested_time,
+                        max_fallback_distance,
+                        sender,
+                    ) => {
                         let frame = (requested_time * fps as f32).floor() as u32;
                         if !sender.is_closed() {
-                            pending_requests.push(PendingRequest { frame, sender });
+                            pending_requests.push(PendingRequest {
+                                frame,
+                                max_fallback_distance,
+                                sender,
+                            });
                         }
                     }
                 }
@@ -619,8 +647,13 @@ impl AVAssetReaderDecoder {
             let max_requested_frame = pending_requests.iter().map(|r| r.frame).max().unwrap();
             let requested_frame = min_requested_frame;
             let requested_time = requested_frame as f32 / fps as f32;
+            let minimum_fallback_frame = pending_requests
+                .iter()
+                .map(|r| r.frame.saturating_sub(r.max_fallback_distance))
+                .min()
+                .unwrap_or(requested_frame);
 
-            let (decoder_idx, was_reset) = this.select_best_decoder(requested_time);
+            let (decoder_idx, was_reset) = this.select_best_decoder(requested_time, is_scrubbing);
 
             let cache_min = if was_reset {
                 min_requested_frame.saturating_sub(FRAME_CACHE_SIZE as u32 * 2)
@@ -668,6 +701,11 @@ impl AVAssetReaderDecoder {
 
                     let position_secs = current_frame as f32 / fps as f32;
                     last_decoded_position = Some(position_secs);
+                    decoder.is_done = false;
+
+                    if current_frame < minimum_fallback_frame {
+                        continue;
+                    }
 
                     let Some(frame) = frame.image_buf() else {
                         tracing::debug!(
@@ -682,8 +720,6 @@ impl AVAssetReaderDecoder {
                     if first_ever_frame.borrow().is_none() {
                         *first_ever_frame.borrow_mut() = Some(cache_frame.data().clone());
                     }
-
-                    decoder.is_done = false;
 
                     let exceeds_cache_bounds = current_frame > cache_max;
                     let too_small_for_cache_bounds = current_frame < cache_min;
@@ -720,8 +756,6 @@ impl AVAssetReaderDecoder {
                                     *last_sent_frame.borrow_mut() = Some(data.clone());
                                     let _ = req.sender.send(data.to_decoded_frame());
                                 } else {
-                                    const MAX_FALLBACK_DISTANCE: u32 = 90;
-
                                     let nearest = cache
                                         .range(..=req.frame)
                                         .next_back()
@@ -729,7 +763,7 @@ impl AVAssetReaderDecoder {
 
                                     if let Some((&frame_num, cached)) = nearest {
                                         let distance = req.frame.abs_diff(frame_num);
-                                        if distance <= MAX_FALLBACK_DISTANCE {
+                                        if distance <= req.max_fallback_distance {
                                             let _ =
                                                 req.sender.send(cached.data().to_decoded_frame());
                                         }
@@ -819,8 +853,11 @@ impl AVAssetReaderDecoder {
                 }
             }
 
-            if let Some(pos) = last_decoded_position {
-                this.pool_manager.update_decoder_position(decoder_idx, pos);
+            if let Some(last_pos) = last_decoded_position {
+                let max_req_time = max_requested_frame as f32 / fps as f32;
+                let capped = last_pos.min(max_req_time);
+                this.pool_manager
+                    .update_decoder_position(decoder_idx, capped);
             }
 
             let mut unfulfilled_count = 0u32;
@@ -834,16 +871,15 @@ impl AVAssetReaderDecoder {
                     let data = cached.data().clone();
                     let _ = req.sender.send(data.to_decoded_frame());
                 } else {
-                    const MAX_FALLBACK_DISTANCE: u32 = 90;
-                    const MAX_FALLBACK_DISTANCE_EOF: u32 = 300;
-                    const MAX_FALLBACK_DISTANCE_NEAR_END: u32 = 180;
+                    let allow_relaxed_fallback = is_scrubbing
+                        || near_video_end
+                        || decoder_at_eof
+                        || decoder_returned_no_frames;
 
-                    let fallback_distance = if decoder_at_eof || decoder_returned_no_frames {
-                        MAX_FALLBACK_DISTANCE_EOF
-                    } else if near_video_end {
-                        MAX_FALLBACK_DISTANCE_NEAR_END
+                    let fallback_distance = if allow_relaxed_fallback {
+                        req.max_fallback_distance.max(MAX_RELAXED_FALLBACK_DISTANCE)
                     } else {
-                        MAX_FALLBACK_DISTANCE
+                        req.max_fallback_distance
                     };
 
                     let nearest = cache
@@ -855,16 +891,24 @@ impl AVAssetReaderDecoder {
                         let distance = req.frame.abs_diff(frame_num);
                         if distance <= fallback_distance {
                             let _ = req.sender.send(cached.data().to_decoded_frame());
-                        } else if let Some(ref last) = *last_sent_frame.borrow() {
+                        } else if allow_relaxed_fallback
+                            && let Some(ref last) = *last_sent_frame.borrow()
+                        {
                             let _ = req.sender.send(last.to_decoded_frame());
-                        } else if let Some(ref first) = *first_ever_frame.borrow() {
+                        } else if allow_relaxed_fallback
+                            && let Some(ref first) = *first_ever_frame.borrow()
+                        {
                             let _ = req.sender.send(first.to_decoded_frame());
                         } else {
                             unfulfilled_count += 1;
                         }
-                    } else if let Some(ref last) = *last_sent_frame.borrow() {
+                    } else if allow_relaxed_fallback
+                        && let Some(ref last) = *last_sent_frame.borrow()
+                    {
                         let _ = req.sender.send(last.to_decoded_frame());
-                    } else if let Some(ref first) = *first_ever_frame.borrow() {
+                    } else if allow_relaxed_fallback
+                        && let Some(ref first) = *first_ever_frame.borrow()
+                    {
                         let _ = req.sender.send(first.to_decoded_frame());
                     } else {
                         unfulfilled_count += 1;
@@ -917,7 +961,7 @@ mod tests {
         for _ in 0..DecoderHealth::MAX_CONSECUTIVE_EMPTY {
             health.record_empty_iteration();
         }
-        assert!(health.needs_recreation(50, 100));
+        assert!(health.needs_recreation(50, 200));
     }
 
     #[test]

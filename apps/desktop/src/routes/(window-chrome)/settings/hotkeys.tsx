@@ -1,4 +1,5 @@
 import { createEventListener } from "@solid-primitives/event-listener";
+import { type as ostype } from "@tauri-apps/plugin-os";
 import {
 	batch,
 	createEffect,
@@ -19,6 +20,7 @@ import {
 	type HotkeyAction,
 	type HotkeysStore,
 } from "~/utils/tauri";
+import { Section, SectionCard, SettingsPageContent } from "./Setting";
 
 const ACTION_TEXT = {
 	startStudioRecording: "Start studio recording",
@@ -53,7 +55,7 @@ function Inner(props: { initialStore: HotkeysStore | null }) {
 	}>(props.initialStore?.hotkeys ?? {});
 
 	createEffect(() => {
-		hotkeysStore.set({ hotkeys: { ...hotkeys } as any });
+		hotkeysStore.set({ hotkeys: { ...hotkeys } as HotkeysStore["hotkeys"] });
 	});
 
 	const [listening, setListening] = createSignal<{
@@ -96,131 +98,140 @@ function Inner(props: { initialStore: HotkeysStore | null }) {
 		] satisfies Array<keyof typeof ACTION_TEXT>;
 
 	return (
-		<div class="flex flex-col flex-1 p-4 h-full custom-scroll">
-			<div class="flex flex-col pb-4 border-b border-gray-2">
-				<h2 class="text-lg font-medium text-gray-12">Shortcuts</h2>
-				<p class="text-sm text-gray-10 w-full max-w-[500px]">
-					Configure system-wide keyboard shortcuts to control Cap
-				</p>
-			</div>
-			<div class="flex flex-col gap-3 p-4 mt-4 w-full rounded-xl border bg-gray-2 border-gray-3">
-				<Index each={actions()}>
-					{(item, idx) => {
-						createEventListener(window, "click", () => {
-							if (listening()?.action !== item()) return;
+		<div class="cap-settings-page flex flex-col h-full custom-scroll">
+			<SettingsPageContent>
+				<Section
+					title="Shortcuts"
+					description="Configure system-wide keyboard shortcuts to control Cap."
+				>
+					<SectionCard class="flex flex-col gap-3 p-4">
+						<Index each={actions()}>
+							{(item, idx) => {
+								createEventListener(window, "click", () => {
+									if (listening()?.action !== item()) return;
 
-							batch(() => {
-								setHotkeys(item(), listening()?.prev);
-								setListening();
-							});
-						});
+									batch(() => {
+										setHotkeys(item(), listening()?.prev);
+										setListening();
+									});
+								});
 
-						return (
-							<>
-								<div class="flex flex-row justify-between items-center w-full h-8">
-									<p class="text-sm text-gray-12">{ACTION_TEXT[item()]}</p>
-									<Switch>
-										<Match when={listening()?.action === item()}>
-											<div class="flex flex-row-reverse gap-2 justify-between items-center h-full text-sm rounded-lg w-fit">
-												<Show
-													when={hotkeys[item()]}
-													fallback={
-														<p class="text-[13px] text-gray-11">
-															Set hotkeys...
-														</p>
-													}
-												>
-													{(binding) => <HotkeyText binding={binding()} />}
-												</Show>
-												<div class="flex flex-row items-center gap-[0.125rem]">
-													<Show when={hotkeys[item()]}>
-														<button
-															class="w-fit"
-															type="button"
-															onBlur={(e) => console.log(e)}
-															onClick={(e) => {
-																e.stopPropagation();
-
-																setListening();
-																commands.setHotkey(
-																	item(),
-																	hotkeys[item()] ?? null,
-																);
-															}}
+								return (
+									<>
+										<div class="flex flex-row justify-between items-center w-full h-8">
+											<p class="text-[13px] text-gray-12">
+												{ACTION_TEXT[item()]}
+											</p>
+											<Switch>
+												<Match when={listening()?.action === item()}>
+													<div class="flex flex-row-reverse gap-2 justify-between items-center h-full text-sm rounded-lg w-fit">
+														<Show
+															when={hotkeys[item()]}
+															fallback={
+																<p class="text-[13px] text-gray-11">
+																	Set hotkeys...
+																</p>
+															}
 														>
-															<IconCapCircleCheck class="transition-colors text-gray-12 hover:text-gray-10 size-5" />
-														</button>
-													</Show>
+															{(binding) => <HotkeyText binding={binding()} />}
+														</Show>
+														<div class="flex flex-row items-center gap-0.5">
+															<Show when={hotkeys[item()]}>
+																<button
+																	class="w-fit"
+																	type="button"
+																	onBlur={(e) => console.log(e)}
+																	onClick={(e) => {
+																		e.stopPropagation();
+
+																		setListening();
+																		commands.setHotkey(
+																			item(),
+																			hotkeys[item()] ?? null,
+																		);
+																	}}
+																>
+																	<IconCapCircleCheck class="transition-colors text-gray-12 hover:text-gray-10 size-5" />
+																</button>
+															</Show>
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	batch(() => {
+																		setListening();
+																		// biome-ignore lint/style/noNonNullAssertion: store
+																		setHotkeys(item(), undefined!);
+																		commands.setHotkey(item(), null);
+																	});
+																}}
+															>
+																<IconCapCircleX class="text-red-500 transition-colors hover:text-red-700 size-5" />
+															</button>
+														</div>
+													</div>
+												</Match>
+												<Match when={listening()?.action !== item()}>
 													<button
 														type="button"
-														onClick={(e) => {
-															e.stopPropagation();
-															batch(() => {
-																setListening();
-																// biome-ignore lint/style/noNonNullAssertion: store
-																setHotkeys(item(), undefined!);
-																commands.setHotkey(item(), null);
-															});
+														class="text-sm bg-transparent rounded-lg"
+														onClick={() => {
+															// ensures that previously selected hotkey is cleared by letting the event propagate before listening to the new hotkey
+															setTimeout(() => {
+																setListening({
+																	action: item(),
+																	prev: hotkeys[item()],
+																});
+															}, 1);
 														}}
 													>
-														<IconCapCircleX class="text-red-500 transition-colors hover:text-red-700 size-5" />
-													</button>
-												</div>
-											</div>
-										</Match>
-										<Match when={listening()?.action !== item()}>
-											<button
-												type="button"
-												class="text-sm bg-transparent rounded-lg"
-												onClick={() => {
-													// ensures that previously selected hotkey is cleared by letting the event propagate before listening to the new hotkey
-													setTimeout(() => {
-														setListening({
-															action: item(),
-															prev: hotkeys[item()],
-														});
-													}, 1);
-												}}
-											>
-												<Show
-													when={hotkeys[item()]}
-													fallback={
-														<p
-															class="flex items-center text-[11px] uppercase transition-colors hover:bg-gray-6 hover:border-gray-7
+														<Show
+															when={hotkeys[item()]}
+															fallback={
+																<p
+																	class="flex items-center text-[11px] uppercase transition-colors hover:bg-gray-6 hover:border-gray-7
                         cursor-pointer py-3 px-2.5 h-5 bg-gray-4 border border-gray-5 rounded-lg text-gray-11 hover:text-gray-12"
+																>
+																	None
+																</p>
+															}
 														>
-															None
-														</p>
-													}
-												>
-													{(binding) => <HotkeyText binding={binding()} />}
-												</Show>
-											</button>
-										</Match>
-									</Switch>
-								</div>
-								{idx !== actions().length - 1 && (
-									<div class="w-full h-px bg-gray-3" />
-								)}
-							</>
-						);
-					}}
-				</Index>
-			</div>
+															{(binding) => <HotkeyText binding={binding()} />}
+														</Show>
+													</button>
+												</Match>
+											</Switch>
+										</div>
+										{idx !== actions().length - 1 && (
+											<div class="w-full h-px bg-gray-3" />
+										)}
+									</>
+								);
+							}}
+						</Index>
+					</SectionCard>
+				</Section>
+			</SettingsPageContent>
 		</div>
 	);
 }
 
 function HotkeyText(props: { binding: Hotkey }) {
-	const keys = [];
+	const os = ostype();
+	const keys: string[] = [];
 
-	// Add modifier keys
-	if (props.binding.meta) keys.push("⌘");
-	if (props.binding.ctrl) keys.push("⌃");
-	if (props.binding.alt) keys.push("⌥");
-	if (props.binding.shift) keys.push("⇧");
+	if (os === "macos") {
+		if (props.binding.meta) keys.push("⌘");
+		if (props.binding.ctrl) keys.push("⌃");
+		if (props.binding.alt) keys.push("⌥");
+		if (props.binding.shift) keys.push("⇧");
+	} else {
+		if (props.binding.meta) keys.push("Win");
+		if (props.binding.ctrl) keys.push("Ctrl");
+		if (props.binding.alt) keys.push("Alt");
+		if (props.binding.shift) keys.push("Shift");
+	}
 
-	// Add the main key
 	const mainKey = props.binding.code.startsWith("Key")
 		? props.binding.code[3]
 		: props.binding.code;
@@ -230,7 +241,7 @@ function HotkeyText(props: { binding: Hotkey }) {
 		<div class="flex gap-1 items-center w-fit group">
 			<For each={keys}>
 				{(key) => (
-					<kbd class="inline-flex justify-center w-fit text-xs items-center p-2 text-[13px] font-medium rounded border size-6 text-gray-11 bg-gray-5 border-gray-6 group-hover:border-gray-8 transition-colors duration-200 group-hover:bg-gray-7">
+					<kbd class="inline-flex justify-center w-fit text-xs items-center p-2 text-[13px] font-medium rounded-sm border size-6 text-gray-11 bg-gray-5 border-gray-6 group-hover:border-gray-8 transition-colors duration-200 group-hover:bg-gray-7">
 						{key}
 					</kbd>
 				)}

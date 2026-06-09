@@ -77,26 +77,34 @@ pub async fn find_incomplete_recordings(
 #[tauri::command]
 #[specta::specta]
 pub async fn recover_recording(app: AppHandle, project_path: String) -> Result<String, String> {
-    let recordings_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("recordings");
-
     let path = PathBuf::from(&project_path);
 
-    let incomplete_list = RecoveryManager::find_incomplete(&recordings_dir);
-
-    let recording = incomplete_list
-        .into_iter()
-        .find(|r| r.project_path == path)
-        .ok_or_else(|| "Recording not found in incomplete list".to_string())?;
+    let recording = tokio::task::spawn_blocking(move || RecoveryManager::inspect_recording(&path))
+        .await
+        .map_err(|e| format!("Recovery scan task failed: {e}"))?
+        .ok_or_else(|| "No recoverable segments found".to_string())?;
 
     if recording.recoverable_segments.is_empty() {
         return Err("No recoverable segments found".to_string());
     }
 
-    let recovered = RecoveryManager::recover(&recording).map_err(|e| format!("{e}"))?;
+    let estimated_duration_secs = recording.estimated_duration.as_secs();
+    let recover_start = std::time::Instant::now();
+    let recovered = match RecoveryManager::recover(&recording) {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = format!("{e}");
+            crate::posthog::async_capture_event(
+                &app,
+                crate::posthog::PostHogEvent::RecordingRecoveryFailed {
+                    trigger: "app_startup",
+                    reason: reason.clone(),
+                },
+            );
+            return Err(reason);
+        }
+    };
+    let validation_took_ms = recover_start.elapsed().as_millis() as u64;
 
     let segment_count = match &recovered.meta {
         StudioRecordingMeta::SingleSegment { .. } => 1,
@@ -106,6 +114,16 @@ pub async fn recover_recording(app: AppHandle, project_path: String) -> Result<S
     info!(
         "Recovered recording with {} segments: {}",
         segment_count, project_path
+    );
+
+    crate::posthog::async_capture_event(
+        &app,
+        crate::posthog::PostHogEvent::RecordingRecovered {
+            trigger: "app_startup",
+            recovered_duration_secs: estimated_duration_secs,
+            segments_recovered: segment_count as u32,
+            validation_took_ms,
+        },
     );
 
     let display_output_path = match &recovered.meta {

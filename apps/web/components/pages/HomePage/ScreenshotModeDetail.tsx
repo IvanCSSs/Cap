@@ -374,7 +374,7 @@ const MockScreenshotEditor = () => {
 
 		const observer = new IntersectionObserver(
 			([entry]) => {
-				if (entry.isIntersecting && !isInView) {
+				if (entry?.isIntersecting && !isInView) {
 					setIsInView(true);
 				}
 			},
@@ -413,6 +413,7 @@ const MockScreenshotEditor = () => {
 			if (cancelled) return;
 			const next = (current + 1) % AUTO_CONFIGS.length;
 			const cfg = AUTO_CONFIGS[next];
+			if (!cfg) return;
 			setGradientIndex(cfg.gradientIndex);
 			setPadding(cfg.padding);
 			setRounded(cfg.rounded);
@@ -903,7 +904,7 @@ const ScreenshotModeDetail = () => {
 				transition={{ duration: 0.5, delay: 0.3 }}
 				className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 mt-5 md:mt-6"
 			>
-				<Button href="/features/screenshot-mode" variant="white" size="lg">
+				<Button href="/features" variant="white" size="lg">
 					Learn more
 				</Button>
 				<UpgradeToPro />

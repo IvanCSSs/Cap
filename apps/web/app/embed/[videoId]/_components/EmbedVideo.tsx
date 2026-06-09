@@ -4,6 +4,7 @@ import type { userSelectProps } from "@cap/database/auth/session";
 import type { comments as commentsSchema, videos } from "@cap/database/schema";
 import { NODE_ENV } from "@cap/env";
 import { Avatar, Logo } from "@cap/ui";
+import type { ViewerSettings } from "@cap/web-backend";
 import { AnimatePresence, motion } from "framer-motion";
 import { useTranscript } from "hooks/use-transcript";
 import {
@@ -15,6 +16,11 @@ import {
 } from "react";
 import { CapVideoPlayer } from "@/app/s/[videoId]/_components/CapVideoPlayer";
 import { HLSVideoPlayer } from "@/app/s/[videoId]/_components/HLSVideoPlayer";
+import { useUploadProgress } from "@/app/s/[videoId]/_components/ProgressCircle";
+import {
+	PreparingVideoOverlay,
+	RecordingInProgressOverlay,
+} from "@/app/s/[videoId]/_components/RecordingInProgress";
 import {
 	formatChaptersAsVTT,
 	formatTranscriptAsVTT,
@@ -24,7 +30,7 @@ import {
 
 declare global {
 	interface Window {
-		MSStream: any;
+		MSStream: unknown;
 	}
 }
 
@@ -51,24 +57,44 @@ export const EmbedVideo = forwardRef<
 		chapters?: { title: string; start: number }[];
 		ownerName?: string | null;
 		autoplay?: boolean;
+		viewerSettings?: ViewerSettings | null;
+		showPlaybackStatusBadge?: boolean;
 	}
 >(
 	(
-		{ data, user, comments, chapters = [], ownerName, autoplay = false },
+		{
+			data,
+			user: _user,
+			comments: _comments,
+			chapters = [],
+			ownerName,
+			autoplay: _autoplay = false,
+			viewerSettings,
+			showPlaybackStatusBadge = false,
+		},
 		ref,
 	) => {
 		const videoRef = useRef<HTMLVideoElement>(null);
 		useImperativeHandle(ref, () => videoRef.current as HTMLVideoElement);
 
 		const [transcriptData, setTranscriptData] = useState<TranscriptEntry[]>([]);
-		const [longestDuration, setLongestDuration] = useState<number>(0);
+		const [longestDuration, setLongestDuration] = useState<number>(
+			data.duration ?? 0,
+		);
 		const [isPlaying, setIsPlaying] = useState(false);
+		const [userConfirmedStopped, setUserConfirmedStopped] = useState(false);
+		const segmentUploadProgress = useUploadProgress(
+			data.id,
+			data.source.type === "desktopSegments" && (data.hasActiveUpload ?? false),
+		);
 		const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
 		const [chaptersUrl, setChaptersUrl] = useState<string | null>(null);
+		const captionsDisabled = viewerSettings?.disableCaptions ?? false;
+		const chaptersDisabled = viewerSettings?.disableChapters ?? false;
 
 		const { data: transcriptContent, error: transcriptError } = useTranscript(
 			data.id,
-			data.transcriptionStatus,
+			captionsDisabled ? null : data.transcriptionStatus,
 		);
 
 		useEffect(() => {
@@ -85,6 +111,7 @@ export const EmbedVideo = forwardRef<
 
 		useEffect(() => {
 			if (
+				!captionsDisabled &&
 				data.transcriptionStatus === "COMPLETE" &&
 				transcriptData &&
 				transcriptData.length > 0
@@ -104,10 +131,10 @@ export const EmbedVideo = forwardRef<
 				if (prev) URL.revokeObjectURL(prev);
 				return null;
 			});
-		}, [data.transcriptionStatus, transcriptData]);
+		}, [captionsDisabled, data.transcriptionStatus, transcriptData]);
 
 		useEffect(() => {
-			if (chapters?.length > 0) {
+			if (!chaptersDisabled && chapters?.length > 0) {
 				const vttContent = formatChaptersAsVTT(chapters);
 				const blob = new Blob([vttContent], { type: "text/vtt" });
 				const newUrl = URL.createObjectURL(blob);
@@ -123,16 +150,43 @@ export const EmbedVideo = forwardRef<
 				if (prev) URL.revokeObjectURL(prev);
 				return null;
 			});
-		}, [chapters]);
+		}, [chapters, chaptersDisabled]);
 
 		const isMp4Source =
 			data.source.type === "desktopMP4" || data.source.type === "webMP4";
+		const isSegmentsSource = data.source.type === "desktopSegments";
+		const isActivelyRecording =
+			isSegmentsSource &&
+			(data.hasActiveUpload ?? false) &&
+			!userConfirmedStopped &&
+			(segmentUploadProgress?.status === "fetching" ||
+				segmentUploadProgress?.status === "uploading");
+
+		const wasRecordingRef = useRef(false);
+		const [isTransitioning, setIsTransitioning] = useState(false);
+
+		useEffect(() => {
+			if (isActivelyRecording) {
+				wasRecordingRef.current = true;
+			} else if (wasRecordingRef.current) {
+				wasRecordingRef.current = false;
+				setIsTransitioning(true);
+				const timer = setTimeout(() => setIsTransitioning(false), 1500);
+				return () => clearTimeout(timer);
+			}
+		}, [isActivelyRecording]);
+
 		let videoSrc: string;
+		const rawFallbackSrc =
+			data.source.type === "webMP4"
+				? `/api/playlist?userId=${data.ownerId}&videoId=${data.id}&videoType=raw-preview`
+				: undefined;
 		let enableCrossOrigin = false;
 
-		if (isMp4Source) {
+		if (isSegmentsSource) {
+			videoSrc = `/api/playlist?userId=${data.ownerId}&videoId=${data.id}&videoType=segments-master`;
+		} else if (isMp4Source) {
 			videoSrc = `/api/playlist?userId=${data.ownerId}&videoId=${data.id}&videoType=mp4`;
-			// Start with CORS enabled for MP4 sources, CapVideoPlayer will disable if needed
 			enableCrossOrigin = true;
 		} else if (
 			NODE_ENV === "development" ||
@@ -174,13 +228,24 @@ export const EmbedVideo = forwardRef<
 		return (
 			<>
 				<div className="relative w-screen h-screen rounded-xl">
-					{isMp4Source ? (
+					{isActivelyRecording ? (
+						<RecordingInProgressOverlay
+							onConfirmStopped={() => setUserConfirmedStopped(true)}
+							className="w-full h-full"
+						/>
+					) : isTransitioning ? (
+						<PreparingVideoOverlay className="w-full h-full" />
+					) : isMp4Source ? (
 						<CapVideoPlayer
 							videoId={data.id}
 							mediaPlayerClassName="w-full h-full"
 							videoSrc={videoSrc}
-							chaptersSrc={chaptersUrl || ""}
-							captionsSrc={subtitleUrl || ""}
+							rawFallbackSrc={rawFallbackSrc}
+							duration={data.duration}
+							showPlaybackStatusBadge={showPlaybackStatusBadge}
+							disableCaptions={captionsDisabled}
+							chaptersSrc={chaptersDisabled ? "" : chaptersUrl || ""}
+							captionsSrc={captionsDisabled ? "" : subtitleUrl || ""}
 							videoRef={videoRef}
 							enableCrossOrigin={enableCrossOrigin}
 							hasActiveUpload={data.hasActiveUpload}
@@ -190,10 +255,13 @@ export const EmbedVideo = forwardRef<
 							videoId={data.id}
 							mediaPlayerClassName="w-full h-full"
 							videoSrc={videoSrc}
-							chaptersSrc={chaptersUrl || ""}
-							captionsSrc={subtitleUrl || ""}
+							duration={data.duration}
+							disableCaptions={captionsDisabled}
+							chaptersSrc={chaptersDisabled ? "" : chaptersUrl || ""}
+							captionsSrc={captionsDisabled ? "" : subtitleUrl || ""}
 							videoRef={videoRef}
 							hasActiveUpload={data.hasActiveUpload}
+							isLiveSegments={isSegmentsSource}
 						/>
 					)}
 				</div>

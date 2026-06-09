@@ -1,8 +1,10 @@
 "use client";
 
 import type { comments as commentsSchema } from "@cap/database/schema";
+import type { ViewerSettingKey } from "@cap/web-backend";
 import type { ImageUpload, Video } from "@cap/web-domain";
 import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "next/navigation";
 import {
 	startTransition,
 	use,
@@ -139,6 +141,13 @@ type AiGenerationStatus =
 	| "ERROR"
 	| "SKIPPED";
 
+type TranscriptionStatus =
+	| "PROCESSING"
+	| "COMPLETE"
+	| "ERROR"
+	| "SKIPPED"
+	| "NO_AUDIO";
+
 interface ShareProps {
 	data: VideoData;
 	comments: MaybePromise<CommentWithAuthor[]>;
@@ -148,20 +157,28 @@ interface ShareProps {
 	videoSettings?: OrganizationSettings | null;
 	userOrganizations?: { id: string; name: string }[];
 	viewerId?: string | null;
+	isEditProcessing: boolean;
+	recordingStopped?: boolean;
+	defaultPlaybackSpeed?: number;
 	initialAiData?: {
 		title?: string | null;
 		summary?: string | null;
 		chapters?: { title: string; start: number }[] | null;
 		aiGenerationStatus?: AiGenerationStatus | null;
 	} | null;
-	aiGenerationEnabled: boolean;
+	aiGenerationAvailable: boolean;
+	transcriptionGenerationAvailable: boolean;
 }
 
 const useVideoStatus = (
 	videoId: Video.VideoId,
-	aiGenerationEnabled: boolean,
+	availability: {
+		aiGeneration: boolean;
+		transcriptionGeneration: boolean;
+	},
 	initialData?: {
 		transcriptionStatus?: string | null;
+		name?: string | null;
 		aiData?: {
 			title?: string | null;
 			summary?: string | null;
@@ -180,16 +197,12 @@ const useVideoStatus = (
 		},
 		initialData: initialData
 			? {
-					transcriptionStatus: initialData.transcriptionStatus as
-						| "PROCESSING"
-						| "COMPLETE"
-						| "ERROR"
-						| "SKIPPED"
-						| "NO_AUDIO"
-						| null,
+					transcriptionStatus:
+						initialData.transcriptionStatus as TranscriptionStatus | null,
 					aiGenerationStatus:
 						(initialData.aiData?.aiGenerationStatus as AiGenerationStatus) ||
 						null,
+					name: initialData.name ?? null,
 					aiTitle: initialData.aiData?.title || null,
 					summary: initialData.aiData?.summary || null,
 					chapters: initialData.aiData?.chapters || null,
@@ -200,10 +213,11 @@ const useVideoStatus = (
 			if (!data) return 2000;
 
 			const shouldContinuePolling = () => {
-				if (
-					!data.transcriptionStatus ||
-					data.transcriptionStatus === "PROCESSING"
-				) {
+				if (!data.transcriptionStatus) {
+					return availability.transcriptionGeneration;
+				}
+
+				if (data.transcriptionStatus === "PROCESSING") {
 					return true;
 				}
 
@@ -216,7 +230,7 @@ const useVideoStatus = (
 				}
 
 				if (data.transcriptionStatus === "COMPLETE") {
-					if (!aiGenerationEnabled) {
+					if (!availability.aiGeneration) {
 						return false;
 					}
 
@@ -235,7 +249,11 @@ const useVideoStatus = (
 						return true;
 					}
 
-					if (!data.aiGenerationStatus && !data.summary && !data.chapters) {
+					if (
+						!data.aiGenerationStatus &&
+						!data.summary &&
+						!data.chapters?.length
+					) {
 						return true;
 					}
 
@@ -257,9 +275,13 @@ export const Share = ({
 	comments,
 	views,
 	initialAiData,
-	aiGenerationEnabled,
 	videoSettings,
 	viewerId,
+	isEditProcessing,
+	recordingStopped = false,
+	defaultPlaybackSpeed,
+	aiGenerationAvailable,
+	transcriptionGenerationAvailable,
 }: ShareProps) => {
 	const effectiveDate: Date = data.metadata?.customCreatedAt
 		? new Date(data.metadata.customCreatedAt)
@@ -278,10 +300,18 @@ export const Share = ({
 		},
 	);
 
-	const { data: videoStatus } = useVideoStatus(data.id, aiGenerationEnabled, {
-		transcriptionStatus: data.transcriptionStatus,
-		aiData: initialAiData,
-	});
+	const { data: videoStatus } = useVideoStatus(
+		data.id,
+		{
+			aiGeneration: aiGenerationAvailable,
+			transcriptionGeneration: transcriptionGenerationAvailable,
+		},
+		{
+			transcriptionStatus: data.transcriptionStatus,
+			name: data.name,
+			aiData: initialAiData,
+		},
+	);
 
 	const transcriptionStatus =
 		videoStatus?.transcriptionStatus || data.transcriptionStatus;
@@ -308,12 +338,32 @@ export const Share = ({
 		});
 	}, [data.id, data.orgId, data.owner.id, viewerId]);
 
+	const isDisabled = (setting: ViewerSettingKey) =>
+		videoSettings?.[setting] ?? data.orgSettings?.[setting] ?? false;
+
+	const areChaptersDisabled = isDisabled("disableChapters");
+	const isSummaryDisabled = isDisabled("disableSummary");
+	const areCaptionsDisabled = isDisabled("disableCaptions");
+	const areCommentStampsDisabled = isDisabled("disableComments");
+	const areReactionStampsDisabled = isDisabled("disableReactions");
+	const allSettingsDisabled =
+		isDisabled("disableComments") &&
+		isDisabled("disableSummary") &&
+		isDisabled("disableTranscript");
+
 	const shouldShowLoading = () => {
-		if (!aiGenerationEnabled) {
+		const hasVisibleAiSection = !isSummaryDisabled || !areChaptersDisabled;
+		const hasAiData = Boolean(aiData.summary || aiData.chapters?.length);
+
+		if (!hasVisibleAiSection || !aiGenerationAvailable || hasAiData) {
 			return false;
 		}
 
-		if (!transcriptionStatus || transcriptionStatus === "PROCESSING") {
+		if (!transcriptionStatus) {
+			return transcriptionGenerationAvailable;
+		}
+
+		if (transcriptionStatus === "PROCESSING") {
 			return true;
 		}
 
@@ -339,7 +389,7 @@ export const Share = ({
 			) {
 				return true;
 			}
-			if (!aiData.aiGenerationStatus && !aiData.summary && !aiData.chapters) {
+			if (!aiData.aiGenerationStatus) {
 				return true;
 			}
 		}
@@ -348,6 +398,21 @@ export const Share = ({
 	};
 
 	const aiLoading = shouldShowLoading();
+
+	const searchParams = useSearchParams();
+	const initialSeekDone = useRef(false);
+
+	useEffect(() => {
+		if (!searchParams.has("recordingStopped")) return;
+
+		const url = new URL(window.location.href);
+		url.searchParams.delete("recordingStopped");
+		window.history.replaceState(
+			window.history.state,
+			"",
+			`${url.pathname}${url.search}${url.hash}`,
+		);
+	}, [searchParams]);
 
 	const handleSeek = useCallback((time: number) => {
 		const v =
@@ -386,6 +451,41 @@ export const Share = ({
 		}, 3000);
 	}, []);
 
+	useEffect(() => {
+		if (initialSeekDone.current) return;
+		const tParam = searchParams.get("t");
+		if (!tParam) return;
+		const t = parseInt(tParam, 10);
+		if (!Number.isFinite(t) || t < 0) return;
+
+		const v =
+			playerRef.current ??
+			(document.querySelector("video") as HTMLVideoElement | null);
+		if (v) {
+			initialSeekDone.current = true;
+			handleSeek(t);
+			return;
+		}
+
+		const interval = setInterval(() => {
+			const el =
+				playerRef.current ??
+				(document.querySelector("video") as HTMLVideoElement | null);
+			if (el) {
+				clearInterval(interval);
+				initialSeekDone.current = true;
+				handleSeek(t);
+			}
+		}, 200);
+
+		const timeout = setTimeout(() => clearInterval(interval), 10000);
+
+		return () => {
+			clearInterval(interval);
+			clearTimeout(timeout);
+		};
+	}, [searchParams, handleSeek]);
+
 	const handleOptimisticComment = useCallback(
 		(comment: CommentType) => {
 			startTransition(() => {
@@ -407,19 +507,6 @@ export const Share = ({
 		}, 100);
 	}, []);
 
-	const isDisabled = (setting: keyof NonNullable<OrganizationSettings>) =>
-		videoSettings?.[setting] ?? data.orgSettings?.[setting] ?? false;
-
-	const areChaptersDisabled = isDisabled("disableChapters");
-	const isSummaryDisabled = isDisabled("disableSummary");
-	const areCaptionsDisabled = isDisabled("disableCaptions");
-	const areCommentStampsDisabled = isDisabled("disableComments");
-	const areReactionStampsDisabled = isDisabled("disableReactions");
-	const allSettingsDisabled =
-		isDisabled("disableComments") &&
-		isDisabled("disableSummary") &&
-		isDisabled("disableTranscript");
-
 	return (
 		<CaptionProvider
 			videoId={data.id}
@@ -440,6 +527,11 @@ export const Share = ({
 									chapters={aiData?.chapters || []}
 									aiGenerationStatus={aiData?.aiGenerationStatus}
 									canRetryProcessing={viewerId === data.owner.id}
+									canFinalizeDesktopSegments={viewerId === data.owner.id}
+									showPlaybackStatusBadge={viewerId === data.owner.id}
+									isEditProcessing={isEditProcessing}
+									recordingStopped={recordingStopped}
+									defaultPlaybackSpeed={defaultPlaybackSpeed}
 									ref={playerRef}
 								/>
 							</div>
@@ -448,6 +540,8 @@ export const Share = ({
 							<Toolbar
 								onOptimisticComment={handleOptimisticComment}
 								onCommentSuccess={handleCommentSuccess}
+								disableComments={areCommentStampsDisabled}
+								disableReactions={areReactionStampsDisabled}
 								data={data}
 							/>
 						</div>
@@ -471,7 +565,7 @@ export const Share = ({
 								onSeek={handleSeek}
 								videoId={data.id}
 								aiData={aiData}
-								aiGenerationEnabled={aiGenerationEnabled}
+								aiGenerationEnabled={aiGenerationAvailable}
 								ref={activityRef}
 							/>
 						</div>
@@ -483,10 +577,8 @@ export const Share = ({
 						<Toolbar
 							onOptimisticComment={handleOptimisticComment}
 							onCommentSuccess={handleCommentSuccess}
-							disableReactions={
-								videoSettings?.disableReactions ??
-								data.orgSettings?.disableReactions
-							}
+							disableComments={areCommentStampsDisabled}
+							disableReactions={areReactionStampsDisabled}
 							data={data}
 						/>
 					</div>

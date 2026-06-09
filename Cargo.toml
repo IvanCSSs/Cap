@@ -65,6 +65,7 @@ cidre = { git = "https://github.com/CapSoftware/cidre", rev = "bf84b67079a8", fe
     "io_surface",
     "mtl",
     "vt",
+    "vn",
 ], default-features = false }
 
 windows = "0.60.0"
@@ -93,6 +94,12 @@ let_unit_value = "deny"
 unnecessary_lazy_evaluations = "deny"
 needless_range_loop = "deny"
 manual_clamp = "deny"
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0
 
 # Optimize for smaller binary size
 [profile.release]

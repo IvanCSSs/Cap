@@ -9,13 +9,13 @@ import { toast } from "sonner";
 import { createVideoAndGetUploadUrl } from "@/actions/video/upload";
 import { useEffectMutation, useRpcClient } from "@/lib/EffectRuntime";
 import { ThumbnailRequest } from "@/lib/Requests/ThumbnailRequest";
+import { uploadWithTarget } from "@/utils/upload-target";
 import { useUploadingContext } from "../../UploadingContext";
 import { sendProgressUpdate } from "../sendProgressUpdate";
 import {
 	InstantRecordingUploader,
 	initiateMultipartUpload,
 	MultipartCompletionUncertainError,
-	ProcessingStartError,
 } from "./instant-mp4-uploader";
 import type { RecordingMode } from "./RecordingModeSelector";
 import { captureThumbnail, convertToMp4 } from "./recording-conversion";
@@ -45,15 +45,16 @@ import {
 } from "./web-recorder-constants";
 import type {
 	ChunkUploadState,
-	PresignedPost,
 	RecorderPhase,
 	RecordingFailureDownload,
 	RecoveredRecordingDownload,
+	UploadTarget,
 	VideoId,
 } from "./web-recorder-types";
 import {
 	detectCapabilities,
 	isUserCancellationError,
+	openShareUrlInNewTab,
 	type RecorderCapabilities,
 	type RecordingPipeline,
 	selectRecordingPipeline,
@@ -81,7 +82,7 @@ type InstantChunkingMode = "manual" | "timeslice";
 type InstantVideoCreation = {
 	id: VideoId;
 	shareUrl: string;
-	upload: PresignedPost;
+	upload: UploadTarget;
 };
 
 const unwrapExitOrThrow = <T, E>(exit: Exit.Exit<T, E>) => {
@@ -112,6 +113,17 @@ const createRecordingDownloadName = (
 	return `cap-recording-${timestamp}.${extension}`;
 };
 
+const triggerBrowserDownload = (url: string, fileName: string) => {
+	const anchor = document.createElement("a");
+	anchor.href = url;
+	anchor.download = fileName;
+	document.body.appendChild(anchor);
+	anchor.click();
+	document.body.removeChild(anchor);
+};
+
+const recoveredToastId = (id: string) => `recovered-${id}`;
+
 export const useWebRecorder = ({
 	organisationId,
 	selectedMicId,
@@ -133,6 +145,9 @@ export const useWebRecorder = ({
 	const [chunkUploads, setChunkUploads] = useState<ChunkUploadState[]>([]);
 	const [errorDownload, setErrorDownload] =
 		useState<RecordingFailureDownload | null>(null);
+	const [completedShareUrl, setCompletedShareUrl] = useState<string | null>(
+		null,
+	);
 	const [recoveredDownloads, setRecoveredDownloads] = useState<
 		RecoveredRecordingDownload[]
 	>([]);
@@ -222,7 +237,7 @@ export const useWebRecorder = ({
 	const videoCreationRef = useRef<{
 		id: VideoId;
 		shareUrl: string;
-		upload: PresignedPost;
+		upload: UploadTarget;
 	} | null>(null);
 	const pendingInstantVideoIdRef = useRef<VideoId | null>(null);
 	const dataRequestIntervalRef = useRef<number | null>(null);
@@ -282,6 +297,7 @@ export const useWebRecorder = ({
 	}, []);
 
 	const dismissRecoveredDownload = useCallback((id: string) => {
+		toast.dismiss(recoveredToastId(id));
 		const url = recoveredDownloadUrlsRef.current.get(id);
 		if (url) {
 			URL.revokeObjectURL(url);
@@ -341,11 +357,26 @@ export const useWebRecorder = ({
 				});
 
 				setRecoveredDownloads(nextDownloads);
-				toast.info(
-					nextDownloads.length === 1
-						? "Recovered an unfinished local recording."
-						: `Recovered ${nextDownloads.length} unfinished local recordings.`,
-				);
+				for (const download of nextDownloads) {
+					toast.info("Recovered an unfinished recording", {
+						id: recoveredToastId(download.id),
+						duration: Infinity,
+						description: new Date(download.createdAt).toLocaleString(),
+						action: {
+							label: "Download",
+							onClick: () => {
+								triggerBrowserDownload(download.url, download.fileName);
+								setTimeout(() => dismissRecoveredDownload(download.id), 500);
+							},
+						},
+						cancel: {
+							label: "Dismiss",
+							onClick: () => {
+								dismissRecoveredDownload(download.id);
+							},
+						},
+					});
+				}
 			})
 			.catch((error) => {
 				console.error("Failed to recover orphaned recording spools", error);
@@ -354,7 +385,7 @@ export const useWebRecorder = ({
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [dismissRecoveredDownload]);
 
 	const disposeRecordingSpool = useCallback(async () => {
 		const spool = recordingSpoolRef.current;
@@ -452,9 +483,8 @@ export const useWebRecorder = ({
 
 	const openShareUrl = useCallback((shareUrl?: string | null) => {
 		if (!shareUrl || shareUrlOpenedRef.current) return;
-		if (typeof window === "undefined") return;
+		if (!openShareUrlInNewTab(shareUrl)) return;
 		shareUrlOpenedRef.current = true;
-		window.open(shareUrl, "_blank", "noopener,noreferrer");
 	}, []);
 	const queryClient = useQueryClient();
 	const deleteVideo = useEffectMutation({
@@ -561,6 +591,7 @@ export const useWebRecorder = ({
 		setChunkUploads([]);
 		setHasAudioTrack(false);
 		replaceErrorDownload(null);
+		setCompletedShareUrl(null);
 		shareUrlOpenedRef.current = false;
 
 		const pendingInstantVideoId = pendingInstantVideoIdRef.current;
@@ -969,14 +1000,15 @@ export const useWebRecorder = ({
 				pendingInstantVideoIdRef.current = creation.id;
 
 				const rawSubpath = `raw-upload.${pipeline.fileExtension}`;
-				const uploadId = await initiateMultipartUpload({
+				const uploadSession = await initiateMultipartUpload({
 					videoId: creationResult.id,
 					contentType: pipeline.mimeType,
 					subpath: rawSubpath,
 				});
 				instantUploaderRef.current = new InstantRecordingUploader({
 					videoId: creationResult.id,
-					uploadId,
+					uploadId: uploadSession.uploadId,
+					provider: uploadSession.provider,
 					mimeType: pipeline.mimeType,
 					subpath: rawSubpath,
 					setUploadStatus,
@@ -997,9 +1029,8 @@ export const useWebRecorder = ({
 			recorder.onerror = onRecorderError;
 
 			const handleVideoEnded = () => {
-				stopRecordingRef.current?.().catch(() => {
-					/* ignore */
-				});
+				window.focus();
+				stopRecordingRef.current?.().catch(() => {});
 			};
 
 			firstTrack?.addEventListener("ended", handleVideoEnded, { once: true });
@@ -1178,10 +1209,6 @@ export const useWebRecorder = ({
 
 			createdVideoId = creationResult.id;
 
-			if (pipeline.mode === "streaming-webm" && creationResult.shareUrl) {
-				openShareUrl(creationResult.shareUrl);
-			}
-
 			updatePhase("uploading");
 			setUploadStatus({
 				status: "uploadingVideo",
@@ -1195,14 +1222,15 @@ export const useWebRecorder = ({
 				const rawSubpath = `raw-upload.${pipeline.fileExtension}`;
 
 				if (!uploader) {
-					const uploadId = await initiateMultipartUpload({
+					const uploadSession = await initiateMultipartUpload({
 						videoId: creationResult.id,
 						contentType: pipeline.mimeType,
 						subpath: rawSubpath,
 					});
 					uploader = new InstantRecordingUploader({
 						videoId: creationResult.id,
-						uploadId,
+						uploadId: uploadSession.uploadId,
+						provider: uploadSession.provider,
 						mimeType: pipeline.mimeType,
 						subpath: rawSubpath,
 						setUploadStatus,
@@ -1224,6 +1252,12 @@ export const useWebRecorder = ({
 					fps,
 					subpath: rawSubpath,
 				});
+
+				if (!uploader.getProcessingStarted()) {
+					toast.warning(
+						"Recording uploaded. Processing did not start yet, but the original recording is available.",
+					);
+				}
 			} else {
 				const processedRecordingBlob =
 					pipeline.fileExtension === "mp4"
@@ -1272,56 +1306,24 @@ export const useWebRecorder = ({
 								orgId: Organisation.OrganisationId.make(orgId),
 							});
 
-							const screenshotFormData = new FormData();
-							Object.entries(screenshotData.presignedPostData.fields).forEach(
-								([key, value]) => {
-									screenshotFormData.append(key, value as string);
-								},
-							);
-							screenshotFormData.append(
-								"file",
-								thumbnailBlob,
-								"screen-capture.jpg",
-							);
-
 							setUploadStatus({
 								status: "uploadingThumbnail",
 								capId: creationResult.id,
 								progress: 90,
 							});
 
-							await new Promise<void>((resolve, reject) => {
-								const xhr = new XMLHttpRequest();
-								xhr.open("POST", screenshotData.presignedPostData.url);
-
-								xhr.upload.onprogress = (event) => {
-									if (event.lengthComputable) {
-										const percent = 90 + (event.loaded / event.total) * 10;
-										setUploadStatus({
-											status: "uploadingThumbnail",
-											capId: creationResult.id,
-											progress: percent,
-										});
-									}
-								};
-
-								xhr.onload = () => {
-									if (xhr.status >= 200 && xhr.status < 300) {
-										resolve();
-									} else {
-										reject(
-											new Error(
-												`Screenshot upload failed with status ${xhr.status}`,
-											),
-										);
-									}
-								};
-
-								xhr.onerror = () => {
-									reject(new Error("Screenshot upload failed"));
-								};
-
-								xhr.send(screenshotFormData);
+							await uploadWithTarget({
+								target: screenshotData.uploadTarget,
+								body: thumbnailBlob,
+								fileName: "screen-capture.jpg",
+								onProgress: ({ loaded, total }) => {
+									const percent = 90 + (loaded / total) * 10;
+									setUploadStatus({
+										status: "uploadingThumbnail",
+										capId: creationResult.id,
+										progress: percent,
+									});
+								},
 							});
 
 							queryClient.refetchQueries({
@@ -1347,6 +1349,7 @@ export const useWebRecorder = ({
 			await disposeRecordingSpool();
 
 			setUploadStatus(undefined);
+			setCompletedShareUrl(creationResult.shareUrl);
 			updatePhase("completed");
 			toast.success(
 				pipeline.mode === "streaming-webm"
@@ -1359,20 +1362,6 @@ export const useWebRecorder = ({
 			console.error("Failed to process recording", err);
 			setUploadStatus(undefined);
 			const failureBlob = await resolveFailureBlob(rawRecordingBlob);
-			if (err instanceof ProcessingStartError) {
-				instantUploaderRef.current = null;
-				recordingPipelineRef.current = null;
-				pendingInstantVideoIdRef.current = null;
-				videoCreationRef.current = null;
-				replaceErrorDownload(failureBlob);
-				await disposeRecordingSpool();
-				updatePhase("error");
-				toast.error(
-					"Recording uploaded, but processing could not start. Open the video to retry processing.",
-				);
-				router.refresh();
-				return;
-			}
 			if (err instanceof MultipartCompletionUncertainError) {
 				instantUploaderRef.current = null;
 				recordingPipelineRef.current = null;
@@ -1384,6 +1373,7 @@ export const useWebRecorder = ({
 					"Upload confirmation was interrupted. Open the video to verify processing before retrying.",
 				);
 				openShareUrl(videoCreationRef.current?.shareUrl ?? null);
+				setCompletedShareUrl(videoCreationRef.current?.shareUrl ?? null);
 				router.refresh();
 				return;
 			}
@@ -1517,6 +1507,7 @@ export const useWebRecorder = ({
 		hasAudioTrack,
 		chunkUploads,
 		errorDownload,
+		completedShareUrl,
 		recoveredDownloads,
 		isSettingUp,
 		isRecording: isRecordingActive,
@@ -1527,6 +1518,7 @@ export const useWebRecorder = ({
 		pauseRecording,
 		resumeRecording,
 		stopRecording,
+		openCompletedShareUrl: () => openShareUrl(completedShareUrl),
 		restartRecording,
 		resetState,
 		dismissRecoveredDownload,

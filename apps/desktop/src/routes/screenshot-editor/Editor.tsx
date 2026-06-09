@@ -13,6 +13,7 @@ import {
 	Show,
 	Switch,
 } from "solid-js";
+import { unwrap } from "solid-js/store";
 import { Transition } from "solid-transition-group";
 import {
 	CROP_ZERO,
@@ -27,7 +28,7 @@ import IconCapCircleX from "~icons/cap/circle-x";
 import IconLucideMaximize from "~icons/lucide/maximize";
 import IconLucideRatio from "~icons/lucide/ratio";
 import { AnnotationConfigBar } from "./AnnotationConfig";
-import { useScreenshotEditorContext } from "./context";
+import { type Annotation, useScreenshotEditorContext } from "./context";
 import { Header } from "./Header";
 import { LayersPanel } from "./LayersPanel";
 import { Preview } from "./Preview";
@@ -40,12 +41,17 @@ export function Editor() {
 		projectHistory,
 		setActiveTool,
 		setSelectedAnnotationId,
+		annotations,
+		setAnnotations,
+		selectedAnnotationId,
 		layersPanelOpen,
 		setLayersPanelOpen,
 		activePopover,
 		setActivePopover,
 		isRenderReady,
 	} = useScreenshotEditorContext();
+	const [copiedAnnotation, setCopiedAnnotation] =
+		createSignal<Annotation | null>(null);
 
 	createEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -61,9 +67,41 @@ export function Editor() {
 
 			const isMod = e.metaKey || e.ctrlKey;
 			const isShift = e.shiftKey;
+			const key = e.key.toLowerCase();
+
+			if (isMod && key === "c") {
+				const id = selectedAnnotationId();
+				const annotation = annotations.find((a) => a.id === id);
+				if (annotation) {
+					e.preventDefault();
+					e.stopImmediatePropagation();
+					setCopiedAnnotation(structuredClone(unwrap(annotation)));
+					return;
+				}
+			}
+
+			if (isMod && key === "v") {
+				const annotation = copiedAnnotation();
+				if (annotation) {
+					e.preventDefault();
+					e.stopImmediatePropagation();
+					projectHistory.push();
+					const duplicate = {
+						...structuredClone(annotation),
+						id: crypto.randomUUID(),
+						x: annotation.x + 16,
+						y: annotation.y + 16,
+					};
+					setAnnotations((prev) => [...prev, duplicate]);
+					setSelectedAnnotationId(duplicate.id);
+					setActiveTool("select");
+					setCopiedAnnotation(duplicate);
+					return;
+				}
+			}
 
 			// Undo / Redo
-			if (isMod && e.key.toLowerCase() === "z") {
+			if (isMod && key === "z") {
 				e.preventDefault();
 				if (isShift) {
 					projectHistory.redo();
@@ -72,7 +110,7 @@ export function Editor() {
 				}
 				return;
 			}
-			if (isMod && e.key.toLowerCase() === "y") {
+			if (isMod && key === "y") {
 				e.preventDefault();
 				projectHistory.redo();
 				return;
@@ -80,7 +118,7 @@ export function Editor() {
 
 			// Tools (No modifiers)
 			if (!isMod && !isShift) {
-				switch (e.key.toLowerCase()) {
+				switch (key) {
 					case "a":
 						setActiveTool("arrow");
 						setSelectedAnnotationId(null);
@@ -139,10 +177,7 @@ export function Editor() {
 				<Header />
 				<AnnotationConfigBar />
 			</div>
-			<div
-				class="flex overflow-y-hidden flex-1 gap-0 pb-0 w-full min-h-0 leading-5 animate-in fade-in"
-				data-tauri-drag-region
-			>
+			<div class="flex overflow-y-hidden flex-1 gap-0 pb-0 w-full min-h-0 leading-5 animate-in fade-in">
 				<Show when={layersPanelOpen()}>
 					<LayersPanel />
 				</Show>
@@ -236,6 +271,19 @@ function Dialogs() {
 											height: originalSize.y,
 										};
 
+								const previewSize = () => {
+									const srcW = originalSize.x;
+									const srcH = originalSize.y;
+									const maxW = Math.min(windowSize().width * 0.8, 768);
+									const maxH = windowSize().height * 0.65;
+									const ratio = Math.min(maxW / srcW, maxH / srcH);
+
+									return {
+										width: `${srcW * ratio}px`,
+										height: `${srcH * ratio}px`,
+									};
+								};
+
 								const [snapToRatio, setSnapToRatioEnabled] = makePersisted(
 									createSignal(true),
 									{ name: "editorCropSnapToRatio" },
@@ -246,6 +294,7 @@ function Dialogs() {
 									positionAtCursor = false,
 								) {
 									e.preventDefault();
+									e.stopPropagation();
 									const items = createCropOptionsMenuItems({
 										aspect: aspect(),
 										snapToRatioEnabled: snapToRatio(),
@@ -256,12 +305,11 @@ function Dialogs() {
 									let pos: LogicalPosition | undefined;
 									if (!positionAtCursor) {
 										const rect = (
-											e.target as HTMLDivElement
+											e.currentTarget as HTMLDivElement
 										).getBoundingClientRect();
 										pos = new LogicalPosition(rect.x, rect.y + 40);
 									}
 									await menu.popup(pos);
-									await menu.close();
 								}
 
 								function BoundInput(props: {
@@ -281,7 +329,7 @@ function Dialogs() {
 											format={false}
 										>
 											<NumberField.Input
-												class="rounded-[0.5rem] bg-gray-2 hover:ring-1 py-[18px] hover:ring-gray-5 h-[2rem] font-normal placeholder:text-black-transparent-40 text-xs caret-gray-500 transition-shadow duration-200 focus:ring-offset-1 focus:bg-gray-3 focus:ring-offset-gray-100 focus:ring-1 focus:ring-gray-10 px-[0.5rem] w-full text-[0.875rem] outline-none text-gray-12"
+												class="rounded-lg bg-gray-2 hover:ring-1 py-[18px] hover:ring-gray-5 h-8 font-normal placeholder:text-black-transparent-40 text-xs caret-gray-500 transition-shadow duration-200 focus:ring-offset-1 focus:bg-gray-3 focus:ring-offset-gray-100 focus:ring-1 focus:ring-gray-10 px-2 w-full text-[0.875rem] outline-hidden text-gray-12"
 												onKeyDown={composeEventHandlers<HTMLInputElement>([
 													(e) => e.stopPropagation(),
 												])}
@@ -293,36 +341,35 @@ function Dialogs() {
 								return (
 									<>
 										<Dialog.Header>
-											<div class="flex flex-row space-x-[2rem]">
-												<div class="flex flex-row items-center space-x-[0.75rem] text-gray-11">
+											<div class="flex flex-row space-x-8">
+												<div class="flex flex-row items-center space-x-3 text-gray-11">
 													<span>Size</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="width" max={originalSize.x} />
 													</div>
 													<span>×</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="height" max={originalSize.y} />
 													</div>
 												</div>
-												<div class="flex flex-row items-center space-x-[0.75rem] text-gray-11">
+												<div class="flex flex-row items-center space-x-3 text-gray-11">
 													<span>Position</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="x" />
 													</div>
 													<span>×</span>
-													<div class="w-[3.25rem]">
+													<div class="w-13">
 														<BoundInput field="y" />
 													</div>
 												</div>
 											</div>
 											<div class="flex flex-row gap-3 justify-end items-center w-full">
-												<div class="flex flex-row items-center space-x-[0.5rem] text-gray-11"></div>
+												<div class="flex flex-row items-center space-x-2 text-gray-11"></div>
 
 												<Button
 													variant="white"
 													size="xs"
-													class="flex items-center justify-center text-center rounded-full h-[2rem] w-[2rem] border focus:border-blue-9"
-													onMouseDown={showCropOptionsMenu}
+													class="flex items-center justify-center text-center rounded-full h-8 w-8 border focus:border-blue-9"
 													onClick={showCropOptionsMenu}
 												>
 													<div class="relative pointer-events-none size-4">
@@ -331,7 +378,7 @@ function Dialogs() {
 														</Show>
 														<Transition
 															enterClass="scale-50 opacity-0 blur-md"
-															enterActiveClass="duration-200 [transition-timing-function:cubic-bezier(0.215,0.61,0.355,1)]"
+															enterActiveClass="duration-200 ease-[cubic-bezier(0.215,0.61,0.355,1)]"
 															enterToClass="scale-100 opacity-100 blur-0"
 															exitClass="opacity-0"
 															exitActiveClass="duration-0"
@@ -377,53 +424,35 @@ function Dialogs() {
 										</Dialog.Header>
 										<Dialog.Content>
 											<div class="flex flex-row justify-center items-center">
-												<div
-													class="rounded overflow-hidden relative select-none"
-													style={{
-														width: (() => {
-															const srcW = originalSize.x;
-															const srcH = originalSize.y;
-															const maxW = Math.min(
-																windowSize().width * 0.8,
-																768,
-															);
-															const maxH = windowSize().height * 0.65;
-															const ratio = Math.min(maxW / srcW, maxH / srcH);
-															return `${srcW * ratio}px`;
-														})(),
-														height: (() => {
-															const srcW = originalSize.x;
-															const srcH = originalSize.y;
-															const maxW = Math.min(
-																windowSize().width * 0.8,
-																768,
-															);
-															const maxH = windowSize().height * 0.65;
-															const ratio = Math.min(maxW / srcW, maxH / srcH);
-															return `${srcH * ratio}px`;
-														})(),
-													}}
-												>
-													<Cropper
-														ref={cropperRef}
-														onCropChange={setCrop}
-														aspectRatio={aspect() ?? undefined}
-														targetSize={{
-															x: originalSize.x,
-															y: originalSize.y,
-														}}
-														initialCrop={initialBounds}
-														snapToRatioEnabled={snapToRatio()}
-														showBounds={true}
-														allowLightMode={true}
-														onContextMenu={(e) => showCropOptionsMenu(e, true)}
+												<div class="rounded-[1.25rem] bg-gray-2/80 p-3 shadow-xs ring-1 ring-black/5 dark:bg-gray-3/80">
+													<div
+														class="relative rounded-sm overflow-visible select-none"
+														style={previewSize()}
 													>
-														<img
-															class="w-full h-full pointer-events-none select-none"
-															alt="screenshot"
-															src={convertFileSrc(imagePath())}
-														/>
-													</Cropper>
+														<Cropper
+															ref={cropperRef}
+															onCropChange={setCrop}
+															aspectRatio={aspect() ?? undefined}
+															targetSize={{
+																x: originalSize.x,
+																y: originalSize.y,
+															}}
+															initialCrop={initialBounds}
+															snapToRatioEnabled={snapToRatio()}
+															showBounds={true}
+															useBackdropFilter={true}
+															allowLightMode={true}
+															onContextMenu={(e) =>
+																showCropOptionsMenu(e, true)
+															}
+														>
+															<img
+																class="w-full h-full pointer-events-none select-none shadow-sm"
+																alt="screenshot"
+																src={convertFileSrc(imagePath())}
+															/>
+														</Cropper>
+													</div>
 												</div>
 											</div>
 										</Dialog.Content>

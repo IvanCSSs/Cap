@@ -4,7 +4,7 @@ import { makePersisted } from "@solid-primitives/storage";
 import { createMutation } from "@tanstack/solid-query";
 import { Channel } from "@tauri-apps/api/core";
 import { CheckMenuItem, Menu } from "@tauri-apps/api/menu";
-import { ask, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { remove } from "@tauri-apps/plugin-fs";
 import { type as ostype } from "@tauri-apps/plugin-os";
 import { cx } from "cva";
@@ -28,8 +28,12 @@ import CaptionControlsWindows11 from "~/components/titlebar/controls/CaptionCont
 import { authStore } from "~/store";
 import { trackEvent } from "~/utils/analytics";
 import { createSignInMutation } from "~/utils/auth";
-import { createExportTask } from "~/utils/export";
-import { createOrganizationsQuery } from "~/utils/queries";
+import {
+	beginExportSessionGuard,
+	createExportTask,
+	createExportToFileTask,
+} from "~/utils/export";
+import { createSelectedOrganization } from "~/utils/organization-branding";
 import {
 	commands,
 	type ExportCompression,
@@ -111,7 +115,48 @@ interface Settings {
 	exportTo: ExportToOption;
 	resolution: { label: string; value: string; width: number; height: number };
 	compression: ExportCompression;
+	optimizeFilesize: boolean;
 	organizationId?: string | null;
+}
+
+function buildExportSettings(
+	settings: Settings,
+	cursorOnly: boolean,
+	compressionBpp: number | null,
+	forceFfmpegDecoder: boolean,
+): ExportSettings {
+	const resolutionBase = {
+		x: settings.resolution.width,
+		y: settings.resolution.height,
+	};
+
+	if (cursorOnly) {
+		return {
+			format: "Mov",
+			fps: settings.fps,
+			resolution_base: resolutionBase,
+			cursor_only: true,
+		};
+	}
+
+	if (settings.format === "Mp4") {
+		return {
+			format: "Mp4",
+			fps: settings.fps,
+			resolution_base: resolutionBase,
+			compression: settings.compression,
+			custom_bpp: compressionBpp,
+			force_ffmpeg_decoder: forceFfmpegDecoder,
+			optimize_filesize: settings.optimizeFilesize,
+		};
+	}
+
+	return {
+		format: "Gif",
+		fps: settings.fps,
+		resolution_base: resolutionBase,
+		quality: null,
+	};
 }
 
 export function ExportPage() {
@@ -125,14 +170,11 @@ export function ExportPage() {
 		refetchMeta,
 	} = useEditorContext();
 
-	const handleBack = () => {
-		setDialog((d) => ({ ...d, open: false }));
-	};
-
 	const projectPath = editorInstance.path;
 
 	const auth = authStore.createQuery();
-	const organisations = createOrganizationsQuery();
+	const organizationSelection = createSelectedOrganization();
+	const organisations = organizationSelection.organizations;
 
 	const hasTransparentBackground = () => {
 		const backgroundSource =
@@ -147,7 +189,10 @@ export function ExportPage() {
 	const isCancellationError = (error: unknown) =>
 		error instanceof SilentError ||
 		error === "Export cancelled" ||
-		(error instanceof Error && error.message === "Export cancelled");
+		error === "Save dialog cancelled" ||
+		(error instanceof Error &&
+			(error.message === "Export cancelled" ||
+				error.message === "Save dialog cancelled"));
 
 	const [_settings, setSettings] = makePersisted(
 		createStore<Settings>({
@@ -156,6 +201,7 @@ export function ExportPage() {
 			exportTo: "file",
 			resolution: { label: "720p", value: "720p", width: 1280, height: 720 },
 			compression: "Maximum",
+			optimizeFilesize: false,
 		}),
 		{ name: "export_settings" },
 	);
@@ -166,24 +212,68 @@ export function ExportPage() {
 		"Web",
 		"Potato",
 	];
+	const [cursorOnly, setCursorOnly] = createSignal(false);
+
+	const requiresTransparentExport = () => hasTransparentBackground();
+	const disablesLinkExport = () => hasTransparentBackground() || cursorOnly();
+	const shouldUseGifMode = () =>
+		!cursorOnly() &&
+		(hasTransparentBackground() ||
+			(_settings.format === "Gif" && _settings.exportTo !== "link"));
+	const isMovCursorOnlyExport = () => cursorOnly();
+	const resetTransientExportOptions = () => {
+		setCursorOnly(false);
+	};
+	const handleBack = () => {
+		resetTransientExportOptions();
+		setDialog((d) => ({ ...d, open: false }));
+	};
 
 	const settings = mergeProps(_settings, () => {
 		const ret: Partial<Settings> = {};
-		if (hasTransparentBackground() && _settings.format === "Mp4")
-			ret.format = "Gif";
-		else if (_settings.format === "Gif" && _settings.exportTo === "link")
-			ret.format = "Mp4";
-		else if (!["Mp4", "Gif"].includes(_settings.format)) ret.format = "Mp4";
+		if (!["Mp4", "Gif"].includes(_settings.format)) ret.format = "Mp4";
+		else if (!cursorOnly()) {
+			if (requiresTransparentExport() && _settings.format === "Mp4")
+				ret.format = "Gif";
+			else if (
+				!requiresTransparentExport() &&
+				_settings.format === "Gif" &&
+				_settings.exportTo === "link"
+			)
+				ret.format = "Mp4";
+		}
+
+		if (disablesLinkExport() && _settings.exportTo === "link")
+			ret.exportTo = "file";
+
+		if (shouldUseGifMode()) {
+			if (!["720p", "1080p"].includes(_settings.resolution.value)) {
+				ret.resolution = { ...RESOLUTION_OPTIONS._720p };
+			}
+			if (GIF_FPS_OPTIONS.every((option) => option.value !== _settings.fps)) {
+				ret.fps = 15;
+			}
+		} else if (FPS_OPTIONS.every((option) => option.value !== _settings.fps)) {
+			ret.fps = 30;
+		}
 
 		if (!VALID_COMPRESSIONS.includes(_settings.compression))
 			ret.compression = "Maximum";
 
 		Object.defineProperty(ret, "organizationId", {
 			get() {
-				if (!_settings.organizationId && organisations().length > 0)
-					return organisations()[0].id;
+				const selectedOrganizationId =
+					organizationSelection.selectedOrganizationId();
+				if (!_settings.organizationId) return selectedOrganizationId;
+				if (
+					organisations().some(
+						(organization) => organization.id === _settings.organizationId,
+					)
+				) {
+					return _settings.organizationId;
+				}
 
-				return _settings.organizationId;
+				return selectedOrganizationId;
 			},
 		});
 
@@ -192,6 +282,7 @@ export function ExportPage() {
 
 	const [previewUrl, setPreviewUrl] = createSignal<string | null>(null);
 	const [previewLoading, setPreviewLoading] = createSignal(false);
+	const [previewUnavailable, setPreviewUnavailable] = createSignal(false);
 	const [renderEstimate, setRenderEstimate] = createSignal<{
 		frameRenderTimeMs: number;
 		totalFrames: number;
@@ -209,7 +300,8 @@ export function ExportPage() {
 		width: number,
 		height: number,
 		bpp: number,
-	): EstimateCacheKey => `${fps}-${width}-${height}-${bpp}`;
+		mode: "video" | "gif" | "cursor",
+	): EstimateCacheKey => `${fps}-${width}-${height}-${bpp}-${mode}`;
 
 	const updateSettings: typeof setSettings = ((
 		...args: Parameters<typeof setSettings>
@@ -233,7 +325,7 @@ export function ExportPage() {
 		);
 	};
 
-	const matchingPreset = () => {
+	const _matchingPreset = () => {
 		const currentBpp = compressionBpp();
 		return COMPRESSION_OPTIONS.find(
 			(opt) => Math.abs(opt.bpp - currentBpp) < 0.001,
@@ -250,15 +342,26 @@ export function ExportPage() {
 		),
 	);
 
-	const fetchPreview = async (
-		frameTime: number,
-		fps: number,
-		resWidth: number,
-		resHeight: number,
-		bpp: number,
-		retryCount = 0,
-	) => {
-		const cacheKey = getEstimateCacheKey(fps, resWidth, resHeight, bpp);
+	type PreviewRequest = {
+		frameTime: number;
+		fps: number;
+		resWidth: number;
+		resHeight: number;
+		bpp: number;
+	};
+
+	let previewInFlight = false;
+	let pendingPreviewRequest: PreviewRequest | null = null;
+
+	const runPreviewRequest = async (request: PreviewRequest, retryCount = 0) => {
+		const { frameTime, fps, resWidth, resHeight, bpp } = request;
+		const cacheKey = getEstimateCacheKey(
+			fps,
+			resWidth,
+			resHeight,
+			bpp,
+			isMovCursorOnlyExport() ? "cursor" : shouldUseGifMode() ? "gif" : "video",
+		);
 		const cachedEstimate = estimateCache.get(cacheKey);
 
 		if (cachedEstimate) {
@@ -272,6 +375,7 @@ export function ExportPage() {
 				fps,
 				resolution_base: { x: resWidth, y: resHeight },
 				compression_bpp: bpp,
+				cursor_only: cursorOnly(),
 			});
 
 			const oldUrl = previewUrl();
@@ -292,6 +396,7 @@ export function ExportPage() {
 			if (!cachedEstimate) {
 				estimateCache.set(cacheKey, newEstimate);
 			}
+			setPreviewUnavailable(false);
 			setRenderEstimate(newEstimate);
 		} catch (e) {
 			console.error("Failed to generate preview:", e);
@@ -299,16 +404,32 @@ export function ExportPage() {
 				await new Promise((resolve) =>
 					setTimeout(resolve, 200 * (retryCount + 1)),
 				);
-				return fetchPreview(
-					frameTime,
-					fps,
-					resWidth,
-					resHeight,
-					bpp,
-					retryCount + 1,
-				);
+				return runPreviewRequest(request, retryCount + 1);
+			}
+			setPreviewUnavailable(true);
+		}
+	};
+
+	const fetchPreview = async (
+		frameTime: number,
+		fps: number,
+		resWidth: number,
+		resHeight: number,
+		bpp: number,
+	) => {
+		setPreviewUnavailable(false);
+		pendingPreviewRequest = { frameTime, fps, resWidth, resHeight, bpp };
+		if (previewInFlight) return;
+
+		previewInFlight = true;
+		try {
+			while (pendingPreviewRequest) {
+				const request = pendingPreviewRequest;
+				pendingPreviewRequest = null;
+				await runPreviewRequest(request);
 			}
 		} finally {
+			previewInFlight = false;
 			setPreviewLoading(false);
 		}
 	};
@@ -331,6 +452,7 @@ export function ExportPage() {
 				() => settings.fps,
 				() => settings.resolution.width,
 				() => settings.resolution.height,
+				cursorOnly,
 				compressionBpp,
 			],
 			() => {
@@ -344,6 +466,7 @@ export function ExportPage() {
 					compressionBpp(),
 				);
 			},
+			{ defer: true },
 		),
 	);
 
@@ -354,33 +477,24 @@ export function ExportPage() {
 
 	let cancelCurrentExport: (() => void) | null = null;
 
+	onCleanup(() => {
+		cancelCurrentExport?.();
+		cancelCurrentExport = null;
+	});
+
 	const exportWithSettings = (
 		onProgress: (progress: FramesRendered) => void,
 	) => {
 		const customBpp = advancedMode() && isCustomBpp() ? compressionBpp() : null;
+		const exportSettings = buildExportSettings(
+			settings,
+			isMovCursorOnlyExport(),
+			customBpp,
+			forceFfmpegDecoder(),
+		);
 		const { promise, cancel } = createExportTask(
 			projectPath,
-			settings.format === "Mp4"
-				? {
-						format: "Mp4",
-						fps: settings.fps,
-						resolution_base: {
-							x: settings.resolution.width,
-							y: settings.resolution.height,
-						},
-						compression: settings.compression,
-						custom_bpp: customBpp,
-						force_ffmpeg_decoder: forceFfmpegDecoder(),
-					}
-				: {
-						format: "Gif",
-						fps: settings.fps,
-						resolution_base: {
-							x: settings.resolution.width,
-							y: settings.resolution.height,
-						},
-						quality: null,
-					},
+			exportSettings,
 			onProgress,
 		);
 		cancelCurrentExport = cancel;
@@ -391,6 +505,20 @@ export function ExportPage() {
 
 	const [outputPath, setOutputPath] = createSignal<string | null>(null);
 	const [isCancelled, setIsCancelled] = createSignal(false);
+	const exportFileExtension = () =>
+		isMovCursorOnlyExport() ? "mov" : settings.format === "Gif" ? "gif" : "mp4";
+	const exportedAssetLabel = () =>
+		isMovCursorOnlyExport()
+			? "Cursor track"
+			: settings.format === "Gif"
+				? "GIF"
+				: "Recording";
+	const exportMediumLabel = () =>
+		isMovCursorOnlyExport()
+			? "cursor track"
+			: settings.format === "Gif"
+				? "GIF"
+				: "video";
 
 	const handleCancel = async () => {
 		if (
@@ -418,18 +546,23 @@ export function ExportPage() {
 		mutationFn: async () => {
 			setIsCancelled(false);
 			if (exportState.type !== "idle") return;
-			setExportState(reconcile({ action: "copy", type: "starting" }));
+			const releaseExportSession = await beginExportSessionGuard();
+			try {
+				setExportState(reconcile({ action: "copy", type: "starting" }));
 
-			const outputPath = await exportWithSettings((progress) => {
+				const outputPath = await exportWithSettings((progress) => {
+					if (isCancelled()) throw new SilentError("Cancelled");
+					setExportState({ type: "rendering", progress });
+				});
+
 				if (isCancelled()) throw new SilentError("Cancelled");
-				setExportState({ type: "rendering", progress });
-			});
 
-			if (isCancelled()) throw new SilentError("Cancelled");
+				setExportState({ type: "copying" });
 
-			setExportState({ type: "copying" });
-
-			await commands.copyVideoToClipboard(outputPath);
+				await commands.copyVideoToClipboard(outputPath);
+			} finally {
+				await releaseExportSession();
+			}
 		},
 		onError: (error) => {
 			if (isCancelled() || isCancellationError(error)) {
@@ -443,11 +576,7 @@ export function ExportPage() {
 		},
 		onSuccess() {
 			setExportState({ type: "done" });
-			toast.success(
-				`${
-					settings.format === "Gif" ? "GIF" : "Recording"
-				} exported to clipboard`,
-			);
+			toast.success(`${exportedAssetLabel()} exported to clipboard`);
 		},
 	}));
 
@@ -455,42 +584,39 @@ export function ExportPage() {
 		mutationFn: async () => {
 			setIsCancelled(false);
 			if (exportState.type !== "idle") return;
-
-			const extension = settings.format === "Gif" ? "gif" : "mp4";
-			const savePath = await saveDialog({
-				filters: [
-					{
-						name: `${extension.toUpperCase()} filter`,
-						extensions: [extension],
-					},
-				],
-				defaultPath: `~/Desktop/${meta().prettyName}.${extension}`,
-			});
-			if (!savePath) {
-				throw new SilentError("Save dialog cancelled");
-			}
-
-			setExportState(reconcile({ action: "save", type: "starting" }));
-
-			setOutputPath(savePath);
-
-			trackEvent("export_started", {
-				resolution: settings.resolution,
-				fps: settings.fps,
-				path: savePath,
-			});
-
-			const videoPath = await exportWithSettings((progress) => {
-				if (isCancelled()) throw new SilentError("Cancelled");
-				setExportState({ type: "rendering", progress });
+			const extension = exportFileExtension();
+			const customBpp =
+				advancedMode() && isCustomBpp() ? compressionBpp() : null;
+			const exportSettings = buildExportSettings(
+				settings,
+				isMovCursorOnlyExport(),
+				customBpp,
+				forceFfmpegDecoder(),
+			);
+			const task = createExportToFileTask(
+				projectPath,
+				exportSettings,
+				`${meta().prettyName}.${extension}`,
+				extension,
+				(progress) => {
+					if (isCancelled()) throw new SilentError("Cancelled");
+					setExportState({ type: "rendering", progress });
+				},
+				() => {
+					setExportState(reconcile({ action: "save", type: "starting" }));
+				},
+				() => {
+					setExportState({ action: "save", type: "copying" });
+				},
+			);
+			cancelCurrentExport = task.cancel;
+			const savePath = await task.promise.finally(() => {
+				if (cancelCurrentExport === task.cancel) cancelCurrentExport = null;
 			});
 
 			if (isCancelled()) throw new SilentError("Cancelled");
 
-			setExportState({ type: "copying" });
-
-			await commands.copyFileToPath(videoPath, savePath);
-
+			setOutputPath(savePath);
 			setExportState({ type: "done" });
 		},
 		onError: (error) => {
@@ -506,9 +632,7 @@ export function ExportPage() {
 			setExportState({ type: "idle" });
 		},
 		onSuccess() {
-			toast.success(
-				`${settings.format === "Gif" ? "GIF" : "Recording"} exported to file`,
-			);
+			toast.success(`${exportedAssetLabel()} exported to file`);
 		},
 	}));
 
@@ -516,73 +640,78 @@ export function ExportPage() {
 		mutationFn: async () => {
 			setIsCancelled(false);
 			if (exportState.type !== "idle") return;
-			setExportState(reconcile({ action: "upload", type: "starting" }));
+			const releaseExportSession = await beginExportSessionGuard();
+			try {
+				setExportState(reconcile({ action: "upload", type: "starting" }));
 
-			const existingAuth = await authStore.get();
-			if (!existingAuth) createSignInMutation();
-			trackEvent("create_shareable_link_clicked", {
-				resolution: settings.resolution,
-				fps: settings.fps,
-				has_existing_auth: !!existingAuth,
-			});
+				const existingAuth = await authStore.get();
+				if (!existingAuth) createSignInMutation();
+				trackEvent("create_shareable_link_clicked", {
+					resolution: settings.resolution,
+					fps: settings.fps,
+					has_existing_auth: !!existingAuth,
+				});
 
-			const metadata = await commands.getVideoMetadata(projectPath);
-			const plan = await commands.checkUpgradedAndUpdate();
-			const canShare = {
-				allowed: plan || metadata.duration < 300,
-				reason: !plan && metadata.duration >= 300 ? "upgrade_required" : null,
-			};
+				const metadata = await commands.getVideoMetadata(projectPath);
+				const plan = await commands.checkUpgradedAndUpdate();
+				const canShare = {
+					allowed: plan || metadata.duration < 300,
+					reason: !plan && metadata.duration >= 300 ? "upgrade_required" : null,
+				};
 
-			if (!canShare.allowed) {
-				if (canShare.reason === "upgrade_required") {
-					await commands.showWindow("Upgrade");
-					await new Promise((resolve) => setTimeout(resolve, 1000));
-					throw new SilentError();
+				if (!canShare.allowed) {
+					if (canShare.reason === "upgrade_required") {
+						await commands.showWindow("Upgrade");
+						await new Promise((resolve) => setTimeout(resolve, 1000));
+						throw new SilentError();
+					}
 				}
-			}
 
-			const uploadChannel = new Channel<UploadProgress>((progress) => {
-				console.log("Upload progress:", progress);
-				setExportState(
-					produce((state) => {
-						if (state.type !== "uploading") return;
+				const uploadChannel = new Channel<UploadProgress>((progress) => {
+					console.log("Upload progress:", progress);
+					setExportState(
+						produce((state) => {
+							if (state.type !== "uploading") return;
 
-						state.progress = Math.round(progress.progress * 100);
-					}),
-				);
-			});
-
-			await exportWithSettings((progress) => {
-				if (isCancelled()) throw new SilentError("Cancelled");
-				setExportState({ type: "rendering", progress });
-			});
-
-			if (isCancelled()) throw new SilentError("Cancelled");
-
-			setExportState({ type: "uploading", progress: 0 });
-
-			console.log({ organizationId: settings.organizationId });
-
-			const result = meta().sharing
-				? await commands.uploadExportedVideo(
-						projectPath,
-						"Reupload",
-						uploadChannel,
-						settings.organizationId ?? null,
-					)
-				: await commands.uploadExportedVideo(
-						projectPath,
-						{ Initial: { pre_created_video: null } },
-						uploadChannel,
-						settings.organizationId ?? null,
+							state.progress = Math.round(progress.progress * 100);
+						}),
 					);
+				});
 
-			if (result === "NotAuthenticated")
-				throw new Error("You need to sign in to share recordings");
-			else if (result === "PlanCheckFailed")
-				throw new Error("Failed to verify your subscription status");
-			else if (result === "UpgradeRequired")
-				throw new Error("This feature requires an upgraded plan");
+				await exportWithSettings((progress) => {
+					if (isCancelled()) throw new SilentError("Cancelled");
+					setExportState({ type: "rendering", progress });
+				});
+
+				if (isCancelled()) throw new SilentError("Cancelled");
+
+				setExportState({ type: "uploading", progress: 0 });
+
+				console.log({ organizationId: settings.organizationId });
+
+				const result = meta().sharing
+					? await commands.uploadExportedVideo(
+							projectPath,
+							"Reupload",
+							uploadChannel,
+							settings.organizationId ?? null,
+						)
+					: await commands.uploadExportedVideo(
+							projectPath,
+							{ Initial: { pre_created_video: null } },
+							uploadChannel,
+							settings.organizationId ?? null,
+						);
+
+				if (result === "NotAuthenticated")
+					throw new Error("You need to sign in to share recordings");
+				else if (result === "PlanCheckFailed")
+					throw new Error("Failed to verify your subscription status");
+				else if (result === "UpgradeRequired")
+					throw new Error("This feature requires an upgraded plan");
+			} finally {
+				await releaseExportSession();
+			}
 		},
 		onSuccess: async () => {
 			await refetchMeta();
@@ -630,7 +759,7 @@ export function ExportPage() {
 						ostype() !== "windows" && "pr-2",
 					)}
 				>
-					{ostype() === "macos" && <div class="h-full w-[4rem]" />}
+					{ostype() === "macos" && <div class="h-full w-16" />}
 					<Button
 						variant="gray"
 						onClick={handleBack}
@@ -662,12 +791,16 @@ export function ExportPage() {
 										fallback={
 											<div class="flex flex-col items-center gap-3 text-gray-10">
 												<IconLucideImage class="size-12 text-gray-8" />
-												<span class="text-sm">Generating preview...</span>
+												<span class="text-sm">
+													{previewUnavailable()
+														? "Preview unavailable"
+														: "Generating preview..."}
+												</span>
 											</div>
 										}
 									>
 										<div class="absolute inset-4 rounded-lg bg-gray-4 overflow-hidden">
-											<div class="absolute inset-y-0 w-full animate-shimmer bg-gradient-to-r from-transparent from-30% via-gray-6 via-50% to-transparent to-70%" />
+											<div class="absolute inset-y-0 w-full animate-shimmer bg-linear-to-r from-transparent from-30% via-gray-6 via-50% to-transparent to-70%" />
 										</div>
 									</Show>
 								</div>
@@ -682,7 +815,7 @@ export function ExportPage() {
 									/>
 									<Show when={previewLoading()}>
 										<div class="absolute inset-0 z-50 overflow-hidden pointer-events-none">
-											<div class="absolute inset-y-0 w-full animate-shimmer bg-gradient-to-r from-transparent from-30% via-white/60 via-50% to-transparent to-70%" />
+											<div class="absolute inset-y-0 w-full animate-shimmer bg-linear-to-r from-transparent from-30% via-white/60 via-50% to-transparent to-70%" />
 										</div>
 									</Show>
 									<button
@@ -698,24 +831,26 @@ export function ExportPage() {
 					</div>
 
 					<Show
-						when={!previewLoading() && renderEstimate()}
+						when={
+							!previewUnavailable() && !previewLoading() && renderEstimate()
+						}
 						fallback={
 							<div class="flex items-center justify-center gap-4 mt-4 h-4 text-xs text-gray-11">
 								<span class="flex items-center gap-1.5">
 									<IconLucideClock class="size-3.5" />
-									<span class="h-3.5 w-10 bg-gray-4 rounded animate-pulse" />
+									<span class="h-3.5 w-10 bg-gray-4 rounded-sm animate-pulse" />
 								</span>
 								<span class="flex items-center gap-1.5">
 									<IconLucideMonitor class="size-3.5" />
-									<span class="h-3.5 w-20 bg-gray-4 rounded animate-pulse" />
+									<span class="h-3.5 w-20 bg-gray-4 rounded-sm animate-pulse" />
 								</span>
 								<span class="flex items-center gap-1.5">
 									<IconLucideHardDrive class="size-3.5" />
-									<span class="h-3.5 w-16 bg-gray-4 rounded animate-pulse" />
+									<span class="h-3.5 w-16 bg-gray-4 rounded-sm animate-pulse" />
 								</span>
 								<span class="flex items-center gap-1.5">
 									<IconLucideZap class="size-3.5" />
-									<span class="h-3.5 w-12 bg-gray-4 rounded animate-pulse" />
+									<span class="h-3.5 w-12 bg-gray-4 rounded-sm animate-pulse" />
 								</span>
 							</div>
 						}
@@ -724,7 +859,7 @@ export function ExportPage() {
 							const data = est();
 							const durationSeconds = data.totalFrames / settings.fps;
 
-							const exportSpeedMultiplier = settings.format === "Gif" ? 4 : 10;
+							const exportSpeedMultiplier = shouldUseGifMode() ? 4 : 10;
 							const totalTimeMs =
 								(data.frameRenderTimeMs * data.totalFrames) /
 								exportSpeedMultiplier;
@@ -772,7 +907,15 @@ export function ExportPage() {
 									{(option) => {
 										const Icon = option.icon;
 										const isSelected = () => settings.exportTo === option.value;
-										return (
+										const isDisabled = () =>
+											option.value === "link" && disablesLinkExport();
+										const disabledReason = () =>
+											isDisabled()
+												? cursorOnly()
+													? "Cursor-only exports can only be saved to a file or clipboard"
+													: "Transparent exports can only be saved to a file or clipboard"
+												: undefined;
+										const button = (
 											<button
 												type="button"
 												class={cx(
@@ -780,7 +923,9 @@ export function ExportPage() {
 													isSelected()
 														? "bg-gray-3 border-gray-5 text-gray-12"
 														: "bg-transparent border-transparent text-gray-11 hover:bg-gray-3 hover:border-gray-4",
+													isDisabled() && "opacity-50 cursor-not-allowed",
 												)}
+												disabled={isDisabled()}
 												onClick={() => {
 													setSettings(
 														produce((newSettings) => {
@@ -805,6 +950,12 @@ export function ExportPage() {
 												<span class="text-xs font-medium">{option.label}</span>
 											</button>
 										);
+
+										return disabledReason() ? (
+											<Tooltip content={disabledReason()}>{button}</Tooltip>
+										) : (
+											button
+										);
 									}}
 								</For>
 							</div>
@@ -826,6 +977,9 @@ export function ExportPage() {
 															text: org.name,
 															action: () => {
 																setSettings("organizationId", org.id);
+																void organizationSelection
+																	.setSelectedOrganizationId(org.id)
+																	.catch(console.error);
 															},
 															checked: settings.organizationId === org.id,
 														}),
@@ -856,15 +1010,19 @@ export function ExportPage() {
 								<For each={FORMAT_OPTIONS}>
 									{(option) => {
 										const isDisabled = () =>
-											(option.value === "Mp4" && hasTransparentBackground()) ||
+											cursorOnly() ||
+											(option.value === "Mp4" && requiresTransparentExport()) ||
 											(option.value === "Gif" && settings.exportTo === "link");
 
 										const disabledReason = () =>
-											option.value === "Mp4" && hasTransparentBackground()
-												? "MP4 doesn't support transparency"
-												: option.value === "Gif" && settings.exportTo === "link"
-													? "Links require MP4 format"
-													: undefined;
+											cursorOnly()
+												? "Cursor-only export always uses transparent MOV"
+												: option.value === "Mp4" && requiresTransparentExport()
+													? "MP4 doesn't support transparency"
+													: option.value === "Gif" &&
+															settings.exportTo === "link"
+														? "Links require MP4 format"
+														: undefined;
 
 										const button = (
 											<button
@@ -930,7 +1088,7 @@ export function ExportPage() {
 							<div class="flex gap-1.5">
 								<For
 									each={
-										settings.format === "Gif"
+										shouldUseGifMode()
 											? [RESOLUTION_OPTIONS._720p, RESOLUTION_OPTIONS._1080p]
 											: [
 													RESOLUTION_OPTIONS._720p,
@@ -959,11 +1117,7 @@ export function ExportPage() {
 
 						<Field name="Frame Rate" icon={<IconLucideGauge class="size-4" />}>
 							<div class="flex gap-1.5">
-								<For
-									each={
-										settings.format === "Gif" ? GIF_FPS_OPTIONS : FPS_OPTIONS
-									}
-								>
+								<For each={shouldUseGifMode() ? GIF_FPS_OPTIONS : FPS_OPTIONS}>
 									{(option) => (
 										<button
 											type="button"
@@ -987,7 +1141,7 @@ export function ExportPage() {
 							</div>
 						</Field>
 
-						<Show when={settings.format === "Mp4"}>
+						<Show when={settings.format === "Mp4" && !cursorOnly()}>
 							<Field
 								name="Quality"
 								icon={<IconLucideSparkles class="size-4" />}
@@ -1029,140 +1183,250 @@ export function ExportPage() {
 
 								<button
 									type="button"
-									class="flex items-center gap-2 mt-3 text-xs text-gray-11 hover:text-gray-12 transition-colors"
-									onClick={() => setAdvancedMode(!advancedMode())}
+									role="switch"
+									aria-checked={settings.optimizeFilesize}
+									class="flex items-center gap-2 mt-3 text-xs text-gray-11 hover:text-gray-12 transition-colors w-full"
+									onClick={() =>
+										updateSettings(
+											"optimizeFilesize",
+											!settings.optimizeFilesize,
+										)
+									}
 								>
 									<div
 										class={cx(
-											"w-8 h-4 rounded-full transition-colors relative",
-											advancedMode() ? "bg-blue-9" : "bg-gray-5",
+											"w-8 h-4 rounded-full transition-colors relative shrink-0",
+											settings.optimizeFilesize ? "bg-blue-9" : "bg-gray-5",
 										)}
 									>
 										<div
 											class={cx(
 												"absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
-												advancedMode() ? "translate-x-4" : "translate-x-0.5",
+												settings.optimizeFilesize
+													? "translate-x-4"
+													: "translate-x-0.5",
 											)}
 										/>
 									</div>
-									<span>Advanced</span>
+									<div class="text-left">
+										<span class="block">Optimize file size</span>
+										<span class="text-[10px] text-gray-9">
+											Re-encodes with software for much smaller files (slower)
+										</span>
+									</div>
 								</button>
+							</Field>
+						</Show>
 
-								<Show when={advancedMode()}>
-									<div class="mt-3 space-y-2">
-										<div class="flex items-center justify-between text-xs">
-											<span class="text-gray-11">Bits per pixel</span>
-											<span class="text-gray-12 font-medium tabular-nums">
-												{compressionBpp().toFixed(2)}
+						<Field
+							name="Advanced Options"
+							icon={<IconLucideSparkles class="size-4" />}
+						>
+							<button
+								type="button"
+								class={cx(
+									"w-full flex items-center justify-between px-3 py-2 text-sm font-medium rounded-lg border transition-colors",
+									advancedMode()
+										? "bg-gray-3 border-gray-5 text-gray-12"
+										: "bg-transparent border-gray-4 text-gray-11 hover:bg-gray-3 hover:border-gray-5",
+								)}
+								onClick={() => setAdvancedMode(!advancedMode())}
+							>
+								<span>{advancedMode() ? "Hide options" : "Show options"}</span>
+								<IconCapChevronDown
+									class={cx(
+										"size-4 transition-transform",
+										advancedMode() && "rotate-180",
+									)}
+								/>
+							</button>
+
+							<Show when={advancedMode()}>
+								<div class="mt-3 space-y-4">
+									<button
+										type="button"
+										role="switch"
+										aria-checked={cursorOnly()}
+										class="flex items-center gap-2 text-xs text-gray-11 hover:text-gray-12 transition-colors w-full"
+										onClick={() => setCursorOnly(!cursorOnly())}
+									>
+										<div
+											class={cx(
+												"w-8 h-4 rounded-full transition-colors relative shrink-0",
+												cursorOnly() ? "bg-blue-9" : "bg-gray-5",
+											)}
+										>
+											<div
+												class={cx(
+													"absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
+													cursorOnly() ? "translate-x-4" : "translate-x-0.5",
+												)}
+											/>
+										</div>
+										<div class="text-left">
+											<span class="block">Export cursor only</span>
+											<span class="text-[10px] text-gray-9">
+												Keeps the same cursor motion and clicks on a transparent
+												background
 											</span>
 										</div>
-										<input
-											type="range"
-											min="0.02"
-											max="0.5"
-											step="0.01"
-											value={compressionBpp()}
-											onInput={(e) => {
-												const value = Number.parseFloat(e.currentTarget.value);
-												setPreviewLoading(true);
-												setCompressionBpp(value);
-												const preset = COMPRESSION_OPTIONS.find(
-													(opt) => Math.abs(opt.bpp - value) < 0.001,
-												);
-												if (preset) {
-													setSettings("compression", preset.value);
-												}
-											}}
-											class="w-full h-1.5 bg-gray-4 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-9 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:hover:scale-110"
-										/>
-										<div class="flex justify-between text-[10px] text-gray-9">
-											<span>0.02 (tiny)</span>
-											<span>0.50 (huge)</span>
-										</div>
-										<Show when={isCustomBpp()}>
-											<p class="text-[10px] text-amber-11 mt-1">
-												Using custom bitrate
-											</p>
-										</Show>
+									</button>
 
-										<Show when={ostype() === "macos"}>
-											<div class="mt-4 pt-3 border-t border-gray-4">
-												<button
-													type="button"
-													role="switch"
-													aria-checked={forceFfmpegDecoder()}
-													aria-label="Force FFmpeg decoder"
-													class="flex items-center gap-2 text-xs text-gray-11 hover:text-gray-12 transition-colors w-full"
-													onClick={() =>
-														setForceFfmpegDecoder(!forceFfmpegDecoder())
+									<Show when={cursorOnly()}>
+										<div class="rounded-lg border border-amber-6 bg-amber-3/30 px-3 py-2.5">
+											<div class="flex items-start gap-2">
+												<IconLucideAlertTriangle class="mt-0.5 size-4 shrink-0 text-amber-11" />
+												<div class="text-left">
+													<p class="text-xs font-medium text-amber-11">
+														Warning
+													</p>
+													<p class="text-[10px] text-amber-11">
+														Exports as a transparent MOV. Files are large and
+														best for compositing or editing.
+													</p>
+												</div>
+											</div>
+										</div>
+									</Show>
+
+									<Show when={settings.format === "Mp4" && !cursorOnly()}>
+										<div class="space-y-2 border-t border-gray-4 pt-3">
+											<div class="flex items-center justify-between text-xs">
+												<span class="text-gray-11">Bits per pixel</span>
+												<span class="text-gray-12 font-medium tabular-nums">
+													{compressionBpp().toFixed(2)}
+												</span>
+											</div>
+											<input
+												type="range"
+												min="0.02"
+												max="0.5"
+												step="0.01"
+												value={compressionBpp()}
+												onInput={(e) => {
+													const value = Number.parseFloat(
+														e.currentTarget.value,
+													);
+													setPreviewLoading(true);
+													setCompressionBpp(value);
+													const preset = COMPRESSION_OPTIONS.find(
+														(opt) => Math.abs(opt.bpp - value) < 0.001,
+													);
+													if (preset) {
+														setSettings("compression", preset.value);
 													}
-												>
-													<div
-														class={cx(
-															"w-8 h-4 rounded-full transition-colors relative flex-shrink-0",
-															forceFfmpegDecoder() ? "bg-blue-9" : "bg-gray-5",
-														)}
+												}}
+												class="w-full h-1.5 bg-gray-4 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-9 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:hover:scale-110"
+											/>
+											<div class="flex justify-between text-[10px] text-gray-9">
+												<span>0.02 (tiny)</span>
+												<span>0.50 (huge)</span>
+											</div>
+											<Show when={isCustomBpp()}>
+												<p class="text-[10px] text-amber-11 mt-1">
+													Using custom bitrate
+												</p>
+											</Show>
+
+											<Show when={ostype() === "macos"}>
+												<div class="mt-4 pt-3 border-t border-gray-4">
+													<button
+														type="button"
+														role="switch"
+														aria-checked={forceFfmpegDecoder()}
+														aria-label="Force FFmpeg decoder"
+														class="flex items-center gap-2 text-xs text-gray-11 hover:text-gray-12 transition-colors w-full"
+														onClick={() =>
+															setForceFfmpegDecoder(!forceFfmpegDecoder())
+														}
 													>
 														<div
 															class={cx(
-																"absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
+																"w-8 h-4 rounded-full transition-colors relative shrink-0",
 																forceFfmpegDecoder()
-																	? "translate-x-4"
-																	: "translate-x-0.5",
+																	? "bg-blue-9"
+																	: "bg-gray-5",
 															)}
-														/>
-													</div>
-													<div class="text-left">
-														<span class="block">Force FFmpeg decoder</span>
-														<span class="text-[10px] text-gray-9">
-															Skip hardware decoder (auto-fallback enabled)
-														</span>
-													</div>
-												</button>
-											</div>
-										</Show>
-									</div>
-								</Show>
-							</Field>
-						</Show>
+														>
+															<div
+																class={cx(
+																	"absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
+																	forceFfmpegDecoder()
+																		? "translate-x-4"
+																		: "translate-x-0.5",
+																)}
+															/>
+														</div>
+														<div class="text-left">
+															<span class="block">Force FFmpeg decoder</span>
+															<span class="text-[10px] text-gray-9">
+																Skip hardware decoder (auto-fallback enabled)
+															</span>
+														</div>
+													</button>
+												</div>
+											</Show>
+										</div>
+									</Show>
+								</div>
+							</Show>
+						</Field>
 					</div>
 
 					<div class="p-4 border-t border-gray-3">
 						{settings.exportTo === "link" && !auth.data ? (
-							<SignInButton class="w-full justify-center">
-								<IconCapLink class="size-4" />
-								<span>Sign in to share</span>
-							</SignInButton>
+							<div class="flex flex-col items-center gap-2.5">
+								<SignInButton class="w-full justify-center">
+									<IconCapLink class="size-4" />
+									<span>Sign in to share</span>
+								</SignInButton>
+								<button
+									type="button"
+									class="text-xs font-medium text-gray-12 transition-colors hover:underline underline-offset-2"
+									onClick={handleBack}
+								>
+									Back to Editor
+								</button>
+							</div>
 						) : (
-							<Button
-								class="w-full gap-2 h-12 text-base"
-								variant="blue"
-								size="lg"
-								onClick={() => {
-									if (settings.exportTo === "file") save.mutate();
-									else if (settings.exportTo === "link") upload.mutate();
-									else copy.mutate();
-								}}
-							>
-								{settings.exportTo === "file" && (
-									<>
-										<IconCapFile class="size-5" />
-										Export to File
-									</>
-								)}
-								{settings.exportTo === "clipboard" && (
-									<>
-										<IconCapCopy class="size-5" />
-										Export to Clipboard
-									</>
-								)}
-								{settings.exportTo === "link" && (
-									<>
-										<IconCapLink class="size-5" />
-										Export to Link
-									</>
-								)}
-							</Button>
+							<div class="flex flex-col items-center gap-2.5">
+								<Button
+									class="w-full gap-2 h-12 text-base"
+									variant="blue"
+									size="lg"
+									onClick={() => {
+										if (settings.exportTo === "file") save.mutate();
+										else if (settings.exportTo === "link") upload.mutate();
+										else copy.mutate();
+									}}
+								>
+									{settings.exportTo === "file" && (
+										<>
+											<IconCapFile class="size-5" />
+											Export to File
+										</>
+									)}
+									{settings.exportTo === "clipboard" && (
+										<>
+											<IconCapCopy class="size-5" />
+											Export to Clipboard
+										</>
+									)}
+									{settings.exportTo === "link" && (
+										<>
+											<IconCapLink class="size-5" />
+											Export to Link
+										</>
+									)}
+								</Button>
+								<button
+									type="button"
+									class="text-xs font-medium text-gray-12 transition-colors hover:underline underline-offset-2"
+									onClick={handleBack}
+								>
+									Back to Editor
+								</button>
+							</div>
 						)}
 					</div>
 				</div>
@@ -1218,276 +1482,184 @@ export function ExportPage() {
 					const [copyPressed, setCopyPressed] = createSignal(false);
 					const [clipboardCopyPressed, setClipboardCopyPressed] =
 						createSignal(false);
-					const [showCompletionScreen, setShowCompletionScreen] = createSignal(
-						exportState.type === "done" && exportState.action === "save",
-					);
-
-					createEffect(() => {
-						if (exportState.type === "done" && exportState.action === "save") {
-							setShowCompletionScreen(true);
-						}
-					});
 
 					return (
 						<div
-							class="absolute inset-0 z-50 flex flex-col items-center justify-center p-6 text-gray-12 backdrop-blur-sm"
+							class="flex absolute inset-0 z-50 flex-col gap-6 justify-center items-center p-6 backdrop-blur-md text-gray-12"
 							style={{
 								"background-color":
-									"color-mix(in srgb, var(--gray-1) 85%, transparent)",
+									"color-mix(in srgb, var(--gray-1) 94%, transparent)",
 							}}
 						>
-							<div class="relative z-10 space-y-6 w-full max-w-md text-center">
-								<Switch>
-									<Match
-										when={exportState.action === "copy" && exportState}
-										keyed
-									>
-										{(copyState) => (
-											<div class="flex flex-col gap-4 justify-center items-center h-full">
-												<h1 class="text-lg font-medium text-gray-12">
-													{copyState.type === "starting"
-														? "Preparing..."
-														: copyState.type === "rendering"
-															? settings.format === "Gif"
-																? "Rendering GIF..."
-																: "Rendering video..."
-															: copyState.type === "copying"
-																? "Copying to clipboard..."
-																: "Copied to clipboard"}
-												</h1>
-												<Show
-													when={
-														(copyState.type === "rendering" ||
-															copyState.type === "starting") &&
-														copyState
-													}
-													keyed
-												>
-													{(copyState) => (
-														<>
-															<RenderProgress
-																state={copyState}
-																format={settings.format}
-															/>
-															<Button
-																variant="ghost"
-																size="sm"
-																onClick={handleCancel}
-																class="mt-4 hover:bg-red-500 hover:text-white"
-															>
-																Cancel
-															</Button>
-														</>
-													)}
-												</Show>
-											</div>
-										)}
-									</Match>
-									<Match
-										when={exportState.action === "save" && exportState}
-										keyed
-									>
-										{(saveState) => (
-											<div class="flex flex-col gap-4 justify-center items-center h-full">
-												<Show
-													when={
-														showCompletionScreen() && saveState.type === "done"
-													}
-													fallback={
-														<>
-															<h1 class="text-lg font-medium text-gray-12">
-																{saveState.type === "starting"
-																	? "Preparing..."
-																	: saveState.type === "rendering"
-																		? settings.format === "Gif"
-																			? "Rendering GIF..."
-																			: "Rendering video..."
-																		: saveState.type === "copying"
-																			? "Exporting to file..."
-																			: "Export completed"}
-															</h1>
-															<Show
-																when={
-																	(saveState.type === "rendering" ||
-																		saveState.type === "starting") &&
-																	saveState
-																}
-																keyed
-															>
-																{(copyState) => (
-																	<>
-																		<RenderProgress
-																			state={copyState}
-																			format={settings.format}
-																		/>
-																		<Button
-																			variant="ghost"
-																			size="sm"
-																			onClick={handleCancel}
-																			class="mt-4 hover:bg-red-500 hover:text-white"
-																		>
-																			Cancel
-																		</Button>
-																	</>
-																)}
-															</Show>
-														</>
-													}
-												>
-													<div class="flex flex-col gap-6 items-center duration-500 animate-in fade-in">
-														<div class="flex flex-col gap-3 items-center">
-															<div class="flex justify-center items-center mb-2 rounded-full bg-gray-12 size-10">
-																<IconLucideCheck class="text-gray-1 size-5" />
-															</div>
-															<div class="flex flex-col gap-1 items-center">
-																<h1 class="text-xl font-medium text-gray-12">
-																	Export Complete
-																</h1>
-																<p class="text-sm text-gray-11">
-																	Your{" "}
-																	{settings.format === "Gif" ? "GIF" : "video"}{" "}
-																	is ready
-																</p>
-															</div>
-														</div>
-													</div>
-												</Show>
-											</div>
-										)}
-									</Match>
-									<Match
-										when={exportState.action === "upload" && exportState}
-										keyed
-									>
-										{(uploadState) => (
-											<Switch>
-												<Match
-													when={uploadState.type !== "done" && uploadState}
-													keyed
-												>
-													{(uploadState) => (
-														<div class="flex flex-col gap-4 justify-center items-center">
-															<h1 class="text-lg font-medium text-center text-gray-12">
-																{uploadState.type === "uploading"
-																	? "Uploading..."
-																	: "Preparing..."}
-															</h1>
-															<Switch>
-																<Match
-																	when={
-																		uploadState.type === "uploading" &&
-																		uploadState
-																	}
-																	keyed
-																>
-																	{(uploadState) => (
-																		<ProgressView
-																			amount={uploadState.progress}
-																			label={`Uploading - ${Math.floor(uploadState.progress)}%`}
-																		/>
-																	)}
-																</Match>
-																<Match
-																	when={
-																		uploadState.type !== "uploading" &&
-																		uploadState
-																	}
-																	keyed
-																>
-																	{(renderState) => (
-																		<>
-																			<RenderProgress
-																				state={renderState}
-																				format={settings.format}
-																			/>
-																			<Button
-																				variant="ghost"
-																				size="sm"
-																				onClick={handleCancel}
-																				class="mt-4 hover:bg-red-500 hover:text-white"
-																			>
-																				Cancel
-																			</Button>
-																		</>
-																	)}
-																</Match>
-															</Switch>
-														</div>
-													)}
-												</Match>
-												<Match when={uploadState.type === "done"}>
-													<div class="flex flex-col gap-5 justify-center items-center">
-														<div class="flex flex-col gap-1 items-center">
-															<h1 class="mx-auto text-lg font-medium text-center text-gray-12">
-																Upload Complete
-															</h1>
-															<p class="text-sm text-gray-11">
-																Your Cap has been uploaded successfully
-															</p>
-														</div>
-													</div>
-												</Match>
-											</Switch>
-										)}
-									</Match>
-								</Switch>
-							</div>
-							<Show
-								when={
-									exportState.type === "done" &&
-									(exportState.action === "save" ||
-										exportState.action === "upload")
-								}
-							>
-								<div class="mt-6 flex justify-center gap-4">
+							<Switch>
+								<Match
+									when={exportState.action === "copy" && exportState}
+									keyed
+								>
+									{(copyState) => (
+										<Switch>
+											<Match
+												when={
+													(copyState.type === "starting" ||
+														copyState.type === "rendering") &&
+													copyState
+												}
+												keyed
+											>
+												{(renderState) => (
+													<ActiveExport
+														heading={
+															renderState.type === "rendering"
+																? `Rendering ${exportMediumLabel()}`
+																: "Preparing export"
+														}
+														state={renderState}
+														onCancel={handleCancel}
+													/>
+												)}
+											</Match>
+											<Match when={copyState.type === "copying"}>
+												<ActiveExport heading="Copying to clipboard" />
+											</Match>
+											<Match when={copyState.type === "done"}>
+												<CompletedExport
+													title="Copied to clipboard"
+													subtitle={`Your ${exportMediumLabel()} is ready to paste`}
+												/>
+											</Match>
+										</Switch>
+									)}
+								</Match>
+
+								<Match
+									when={exportState.action === "save" && exportState}
+									keyed
+								>
+									{(saveState) => (
+										<Switch>
+											<Match
+												when={
+													(saveState.type === "starting" ||
+														saveState.type === "rendering") &&
+													saveState
+												}
+												keyed
+											>
+												{(renderState) => (
+													<ActiveExport
+														heading={
+															renderState.type === "rendering"
+																? `Rendering ${exportMediumLabel()}`
+																: "Preparing export"
+														}
+														state={renderState}
+														onCancel={handleCancel}
+													/>
+												)}
+											</Match>
+											<Match when={saveState.type === "copying"}>
+												<ActiveExport heading="Saving to file" />
+											</Match>
+											<Match when={saveState.type === "done"}>
+												<CompletedExport
+													title="Export complete"
+													subtitle={`Your ${exportMediumLabel()} is ready`}
+												/>
+											</Match>
+										</Switch>
+									)}
+								</Match>
+
+								<Match
+									when={exportState.action === "upload" && exportState}
+									keyed
+								>
+									{(uploadState) => (
+										<Switch>
+											<Match
+												when={uploadState.type === "uploading" && uploadState}
+												keyed
+											>
+												{(uploading) => (
+													<ActiveExport
+														heading="Uploading"
+														percent={uploading.progress}
+													/>
+												)}
+											</Match>
+											<Match
+												when={
+													(uploadState.type === "starting" ||
+														uploadState.type === "rendering") &&
+													uploadState
+												}
+												keyed
+											>
+												{(renderState) => (
+													<ActiveExport
+														heading={
+															renderState.type === "rendering"
+																? `Rendering ${exportMediumLabel()}`
+																: "Preparing export"
+														}
+														state={renderState}
+														onCancel={handleCancel}
+													/>
+												)}
+											</Match>
+											<Match when={uploadState.type === "done"}>
+												<CompletedExport
+													title="Upload complete"
+													subtitle="Your Cap has been uploaded successfully"
+												/>
+											</Match>
+										</Switch>
+									)}
+								</Match>
+							</Switch>
+
+							<Show when={exportState.type === "done"}>
+								<div class="flex flex-col gap-3 items-center">
 									<Show
 										when={
-											exportState.action === "upload" &&
-											exportState.type === "done"
+											exportState.action === "upload" && meta().sharing?.link
 										}
 									>
-										<Show when={meta().sharing?.link}>
-											{(link) => (
-												<div class="flex gap-2">
+										{(link) => (
+											<div class="flex gap-2">
+												<Button
+													onClick={() => {
+														setCopyPressed(true);
+														setTimeout(() => {
+															setCopyPressed(false);
+														}, 2000);
+														navigator.clipboard.writeText(link());
+													}}
+													variant="dark"
+													class="flex gap-2 justify-center items-center"
+												>
+													{!copyPressed() ? (
+														<IconCapCopy class="transition-colors duration-200 text-gray-1 size-4 group-hover:text-gray-12" />
+													) : (
+														<IconLucideCheck class="transition-colors duration-200 text-gray-1 size-4 svgpathanimation group-hover:text-gray-12" />
+													)}
+													<p>Copy Link</p>
+												</Button>
+												<a href={link()} target="_blank" rel="noreferrer">
 													<Button
-														onClick={() => {
-															setCopyPressed(true);
-															setTimeout(() => {
-																setCopyPressed(false);
-															}, 2000);
-															navigator.clipboard.writeText(link());
-														}}
 														variant="dark"
 														class="flex gap-2 justify-center items-center"
 													>
-														{!copyPressed() ? (
-															<IconCapCopy class="transition-colors duration-200 text-gray-1 size-4 group-hover:text-gray-12" />
-														) : (
-															<IconLucideCheck class="transition-colors duration-200 text-gray-1 size-4 svgpathanimation group-hover:text-gray-12" />
-														)}
-														<p>Copy Link</p>
+														<IconCapLink class="transition-colors duration-200 text-gray-1 size-4 group-hover:text-gray-12" />
+														<p>Open Link</p>
 													</Button>
-													<a href={link()} target="_blank" rel="noreferrer">
-														<Button
-															variant="dark"
-															class="flex gap-2 justify-center items-center"
-														>
-															<IconCapLink class="transition-colors duration-200 text-gray-1 size-4 group-hover:text-gray-12" />
-															<p>Open Link</p>
-														</Button>
-													</a>
-												</div>
-											)}
-										</Show>
+												</a>
+											</div>
+										)}
 									</Show>
 
-									<Show
-										when={
-											exportState.action === "save" &&
-											exportState.type === "done"
-										}
-									>
-										<div class="flex gap-4 w-full">
+									<Show when={exportState.action === "save"}>
+										<div class="flex gap-3">
 											<Button
 												variant="dark"
 												class="flex gap-2 items-center"
@@ -1513,9 +1685,7 @@ export function ExportPage() {
 														}, 2000);
 														await commands.copyVideoToClipboard(path);
 														toast.success(
-															`${
-																settings.format === "Gif" ? "GIF" : "Video"
-															} copied to clipboard`,
+															`${exportedAssetLabel()} copied to clipboard`,
 														);
 													}
 												}}
@@ -1529,20 +1699,27 @@ export function ExportPage() {
 											</Button>
 										</div>
 									</Show>
+
+									<Button
+										variant="gray"
+										class="flex gap-1.5 items-center"
+										onClick={() => {
+											setExportState({ type: "idle" });
+											handleBack();
+										}}
+									>
+										<IconLucideArrowLeft class="size-4" />
+										Back to Editor
+									</Button>
 								</div>
 							</Show>
-							<Show when={exportState.type === "done"}>
-								<Button
-									variant="gray"
-									class="mt-4 hover:underline"
-									onClick={() => {
-										setExportState({ type: "idle" });
-										handleBack();
-									}}
-								>
-									<IconLucideArrowLeft class="size-4" />
-									Back to Editor
-								</Button>
+
+							<Show when={exportState.type !== "done"}>
+								<p class="max-w-sm text-xs leading-relaxed text-center text-gray-11">
+									<span class="font-semibold text-gray-12">Tip:</span> Use
+									Instant Mode for your next recording to record and upload on
+									the fly, with no exporting required.
+								</p>
 							</Show>
 						</div>
 					);
@@ -1552,37 +1729,99 @@ export function ExportPage() {
 	);
 }
 
-function RenderProgress(props: { state: RenderState; format?: ExportFormat }) {
+function ProgressRing(props: { percent?: number; indeterminate?: boolean }) {
+	const pct = () => Math.max(0, Math.min(100, props.percent ?? 0));
+
 	return (
-		<ProgressView
-			amount={
-				props.state.type === "rendering"
-					? (props.state.progress.renderedCount /
-							props.state.progress.totalFrames) *
-						100
-					: 0
-			}
-			label={
-				props.state.type === "rendering"
-					? `Rendering ${props.format === "Gif" ? "GIF" : "video"} (${
-							props.state.progress.renderedCount
-						}/${props.state.progress.totalFrames} frames)`
-					: "Preparing to render..."
-			}
-		/>
+		<div class="relative size-20">
+			<svg
+				class={cx("size-20 -rotate-90", props.indeterminate && "animate-spin")}
+				viewBox="0 0 64 64"
+				fill="none"
+			>
+				<circle
+					cx="32"
+					cy="32"
+					r="28"
+					stroke="currentColor"
+					stroke-width="4"
+					class="text-gray-4"
+				/>
+				<circle
+					cx="32"
+					cy="32"
+					r="28"
+					stroke="currentColor"
+					stroke-width="4"
+					stroke-linecap="round"
+					stroke-dasharray={
+						props.indeterminate ? "44 176" : `${pct() * 1.76} 176`
+					}
+					class="transition-all duration-300 text-blue-9"
+				/>
+			</svg>
+			<Show when={!props.indeterminate}>
+				<div class="flex absolute inset-0 justify-center items-center">
+					<span class="text-base font-semibold tabular-nums text-gray-12">
+						{Math.round(pct())}%
+					</span>
+				</div>
+			</Show>
+		</div>
 	);
 }
 
-function ProgressView(props: { amount: number; label?: string }) {
+function ActiveExport(props: {
+	heading: string;
+	state?: RenderState;
+	percent?: number;
+	onCancel?: () => void;
+}) {
+	const frames = () =>
+		props.state?.type === "rendering" ? props.state.progress : null;
+
+	const percent = () => {
+		const rendered = frames();
+		if (rendered) return (rendered.renderedCount / rendered.totalFrames) * 100;
+		return props.percent;
+	};
+
 	return (
-		<>
-			<div class="w-full bg-gray-3 rounded-full h-2.5">
-				<div
-					class="bg-blue-9 h-2.5 rounded-full"
-					style={{ width: `${props.amount}%` }}
-				/>
+		<div class="flex flex-col gap-5 items-center w-72 text-center">
+			<ProgressRing
+				percent={percent()}
+				indeterminate={percent() === undefined}
+			/>
+			<div class="flex flex-col gap-1 items-center">
+				<h2 class="text-lg font-medium text-gray-12">{props.heading}</h2>
+				<Show when={frames()}>
+					{(rendered) => (
+						<p class="text-sm tabular-nums text-gray-11">
+							{rendered().renderedCount.toLocaleString()} /{" "}
+							{rendered().totalFrames.toLocaleString()} frames
+						</p>
+					)}
+				</Show>
 			</div>
-			<p class="text-xs tabular-nums">{props.label}</p>
-		</>
+			<Show when={props.onCancel}>
+				<Button variant="gray" size="sm" onClick={() => props.onCancel?.()}>
+					Cancel
+				</Button>
+			</Show>
+		</div>
+	);
+}
+
+function CompletedExport(props: { title: string; subtitle: string }) {
+	return (
+		<div class="flex flex-col gap-4 items-center text-center">
+			<div class="flex justify-center items-center rounded-full size-16 bg-blue-3">
+				<IconLucideCheck class="size-8 text-blue-9" />
+			</div>
+			<div class="flex flex-col gap-1 items-center">
+				<h2 class="text-lg font-medium text-gray-12">{props.title}</h2>
+				<p class="text-sm text-gray-11">{props.subtitle}</p>
+			</div>
+		</div>
 	);
 }

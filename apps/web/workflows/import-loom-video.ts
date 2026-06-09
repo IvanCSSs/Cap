@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { db } from "@cap/database";
 import { videos, videoUploads } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
-import { S3Buckets } from "@cap/web-backend";
-import { S3Bucket, type Video } from "@cap/web-domain";
+import { Storage } from "@cap/web-backend";
+import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { Effect, Option } from "effect";
+import { Effect } from "effect";
 import { FatalError } from "workflow";
 import { runPromise } from "@/lib/server";
 
@@ -19,14 +19,28 @@ interface ImportLoomPayload {
 }
 
 const MINIMUM_VIDEO_SIZE = 1024;
+const MEDIA_SERVER_START_MAX_ATTEMPTS = 6;
+const MEDIA_SERVER_START_RETRY_BASE_MS = 2000;
+const MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS = 720;
+const MEDIA_SERVER_COMPLETION_POLL_INTERVAL_MS = 5000;
+const MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS = 3 * 60 * 60;
+const MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS = 3 * 60 * 60;
+
+function isPositiveNumber(value: number | null): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function getValidDuration(duration: number) {
+	return Number.isFinite(duration) && duration > 0 ? duration : undefined;
+}
 
 function isStreamingUrl(url: string): boolean {
 	const path = (url.split("?")[0] ?? "").toLowerCase();
 	return path.endsWith(".m3u8") || path.endsWith(".mpd");
 }
 
-function isMpdUrl(url: string): boolean {
-	return (url.split("?")[0] ?? "").toLowerCase().endsWith(".mpd");
+function isGoogleDriveResumableUrl(url: string): boolean {
+	return url.includes("googleapis.com/upload/drive/");
 }
 
 async function fetchLoomCdnUrl(
@@ -92,253 +106,7 @@ async function fetchFreshLoomDownloadUrl(loomVideoId: string): Promise<string> {
 	);
 }
 
-function parseMpdVideoSegments(
-	mpdXml: string,
-	baseUrl: string,
-	queryParams: string,
-): { initUrl: string; mediaUrls: string[] } | null {
-	const adaptationSets = [
-		...mpdXml.matchAll(/<AdaptationSet([^>]*)>([\s\S]*?)<\/AdaptationSet>/g),
-	];
-
-	for (const asMatch of adaptationSets) {
-		const attrs = asMatch[1] ?? "";
-		const content = asMatch[2] ?? "";
-		const contentType = attrs.match(/contentType="([^"]+)"/)?.[1];
-
-		if (contentType !== "video") continue;
-
-		const representations = [
-			...content.matchAll(
-				/<Representation([^>]*)>([\s\S]*?)<\/Representation>/g,
-			),
-		];
-		let bestBandwidth = 0;
-		let bestRepContent = "";
-
-		for (const repMatch of representations) {
-			const repAttrs = repMatch[1] ?? "";
-			const repContent = repMatch[2] ?? "";
-			const bandwidth = parseInt(
-				repAttrs.match(/bandwidth="(\d+)"/)?.[1] ?? "0",
-				10,
-			);
-			if (bandwidth > bestBandwidth) {
-				bestBandwidth = bandwidth;
-				bestRepContent = repContent;
-			}
-		}
-
-		if (!bestRepContent) continue;
-
-		const templateMatch = bestRepContent.match(
-			/<SegmentTemplate([^>]*)>([\s\S]*?)<\/SegmentTemplate>/,
-		);
-		if (!templateMatch) continue;
-
-		const templateAttrs = templateMatch[1] ?? "";
-		const templateContent = templateMatch[2] ?? "";
-
-		const initFilename = templateAttrs.match(/initialization="([^"]+)"/)?.[1];
-		const mediaTemplate = templateAttrs.match(/media="([^"]+)"/)?.[1];
-		const startNumber = parseInt(
-			templateAttrs.match(/startNumber="(\d+)"/)?.[1] ?? "0",
-			10,
-		);
-
-		if (!initFilename || !mediaTemplate) continue;
-
-		const sElements = [...templateContent.matchAll(/<S\s([^/]*?)\/>/g)];
-		let segmentCount = 0;
-
-		for (const sEl of sElements) {
-			const r = parseInt(sEl[1]?.match(/r="(\d+)"/)?.[1] ?? "0", 10);
-			segmentCount += 1 + r;
-		}
-
-		const initUrl = `${baseUrl}${initFilename}${queryParams}`;
-		const mediaUrls: string[] = [];
-		for (let i = startNumber; i < startNumber + segmentCount; i++) {
-			const filename = mediaTemplate.replace("$Number$", String(i));
-			mediaUrls.push(`${baseUrl}${filename}${queryParams}`);
-		}
-
-		return { initUrl, mediaUrls };
-	}
-
-	return null;
-}
-
-function parseHlsMediaPlaylist(
-	content: string,
-	baseUrl: string,
-	queryParams: string,
-): string[] {
-	return content
-		.split("\n")
-		.map((l) => l.trim())
-		.filter((l) => l && !l.startsWith("#"))
-		.map((l) => (l.startsWith("http") ? l : `${baseUrl}${l}${queryParams}`));
-}
-
-async function downloadSegmentsToBuffer(urls: string[]): Promise<Buffer> {
-	const chunks: Buffer[] = [];
-	for (const url of urls) {
-		const response = await fetch(url);
-		if (!response.ok) continue;
-		chunks.push(Buffer.from(await response.arrayBuffer()));
-	}
-	return Buffer.concat(chunks);
-}
-
-async function tryMp4Candidates(
-	resourceBaseUrl: string,
-	queryParams: string,
-	loomVideoId: string,
-): Promise<Buffer | null> {
-	const mp4Candidates = [
-		`${resourceBaseUrl}${loomVideoId}.mp4${queryParams}`,
-		`${resourceBaseUrl}output.mp4${queryParams}`,
-	];
-
-	for (const mp4Url of mp4Candidates) {
-		try {
-			const headRes = await fetch(mp4Url, { method: "HEAD" });
-			if (!headRes.ok) continue;
-
-			const response = await fetch(mp4Url);
-			if (!response.ok) continue;
-
-			const buffer = Buffer.from(await response.arrayBuffer());
-			if (buffer.length >= MINIMUM_VIDEO_SIZE) return buffer;
-		} catch {}
-	}
-
-	return null;
-}
-
-async function downloadFromStreamingUrl(
-	streamingUrl: string,
-	loomVideoId: string,
-): Promise<Buffer> {
-	const parsedUrl = new URL(streamingUrl);
-	const queryParams = parsedUrl.search;
-	const pathUpToSlash = parsedUrl.pathname.substring(
-		0,
-		parsedUrl.pathname.lastIndexOf("/") + 1,
-	);
-	const streamingBaseUrl = `${parsedUrl.origin}${pathUpToSlash}`;
-
-	let resourceBaseUrl = streamingBaseUrl;
-	if (pathUpToSlash.endsWith("/hls/")) {
-		resourceBaseUrl = `${parsedUrl.origin}${pathUpToSlash.slice(0, -4)}`;
-	}
-
-	const mp4Buffer = await tryMp4Candidates(
-		resourceBaseUrl,
-		queryParams,
-		loomVideoId,
-	);
-	if (mp4Buffer) return mp4Buffer;
-
-	if (isMpdUrl(streamingUrl)) {
-		const mpdResponse = await fetch(streamingUrl);
-		if (!mpdResponse.ok) {
-			throw new FatalError("Failed to fetch video manifest from Loom");
-		}
-
-		const mpdXml = await mpdResponse.text();
-		const segments = parseMpdVideoSegments(
-			mpdXml,
-			streamingBaseUrl,
-			queryParams,
-		);
-
-		if (!segments || segments.mediaUrls.length === 0) {
-			throw new FatalError("Could not parse video segments from Loom manifest");
-		}
-
-		return await downloadSegmentsToBuffer([
-			segments.initUrl,
-			...segments.mediaUrls,
-		]);
-	}
-
-	const masterResponse = await fetch(streamingUrl);
-	if (!masterResponse.ok) {
-		throw new FatalError("Failed to fetch HLS playlist from Loom");
-	}
-
-	const masterContent = await masterResponse.text();
-	const masterLines = masterContent.split("\n").map((l) => l.trim());
-
-	const isMediaPlaylist = masterLines.some(
-		(l) => l.startsWith("#EXTINF:") || l.startsWith("#EXT-X-TARGETDURATION:"),
-	);
-
-	let segmentUrls: string[];
-
-	if (isMediaPlaylist) {
-		segmentUrls = parseHlsMediaPlaylist(
-			masterContent,
-			streamingBaseUrl,
-			queryParams,
-		);
-	} else {
-		let bestBandwidth = 0;
-		let bestVariantUrl: string | null = null;
-
-		for (let i = 0; i < masterLines.length; i++) {
-			const line = masterLines[i];
-			if (line?.startsWith("#EXT-X-STREAM-INF:")) {
-				const bwMatch = line.match(/BANDWIDTH=(\d+)/);
-				const bandwidth = parseInt(bwMatch?.[1] ?? "0", 10);
-				const nextLine = masterLines[i + 1]?.trim();
-				if (
-					nextLine &&
-					!nextLine.startsWith("#") &&
-					bandwidth > bestBandwidth
-				) {
-					bestBandwidth = bandwidth;
-					bestVariantUrl = nextLine.startsWith("http")
-						? nextLine
-						: `${streamingBaseUrl}${nextLine}${queryParams}`;
-				}
-			}
-		}
-
-		if (!bestVariantUrl) {
-			throw new FatalError("No video variants found in HLS playlist");
-		}
-
-		const variantResponse = await fetch(bestVariantUrl);
-		if (!variantResponse.ok) {
-			throw new FatalError("Failed to fetch HLS variant playlist from Loom");
-		}
-
-		const variantContent = await variantResponse.text();
-		segmentUrls = parseHlsMediaPlaylist(
-			variantContent,
-			streamingBaseUrl,
-			queryParams,
-		);
-	}
-
-	if (segmentUrls.length === 0) {
-		throw new FatalError("No video segments found in HLS playlist");
-	}
-
-	return await downloadSegmentsToBuffer(segmentUrls);
-}
-
-async function downloadVideoContent(
-	downloadUrl: string,
-	loomVideoId: string,
-): Promise<Buffer> {
-	if (isStreamingUrl(downloadUrl)) {
-		return await downloadFromStreamingUrl(downloadUrl, loomVideoId);
-	}
-
+async function downloadVideoContent(downloadUrl: string): Promise<Buffer> {
 	const loomResponse = await fetch(downloadUrl);
 	if (!loomResponse.ok) {
 		throw new FatalError(
@@ -370,28 +138,59 @@ interface VideoProcessingResult {
 	};
 }
 
+interface LoomProcessingInput {
+	sourceVideoUrl?: string;
+	inputExtension?: string;
+}
+
 export async function importLoomVideoWorkflow(
 	payload: ImportLoomPayload,
 ): Promise<VideoProcessingResult> {
 	"use workflow";
 
-	await downloadLoomToS3(payload);
+	try {
+		const processingInput = await downloadLoomToS3(payload);
 
-	const result = await processVideoOnMediaServer(payload);
+		const result = await processVideoOnMediaServer(payload, processingInput);
 
-	await saveMetadataAndComplete(payload.videoId, result.metadata);
+		await saveMetadataAndComplete(payload.videoId, result.metadata);
 
-	return {
-		success: true,
-		message: "Loom video imported successfully",
-		metadata: result.metadata,
-	};
+		return {
+			success: true,
+			message: "Loom video imported successfully",
+			metadata: result.metadata,
+		};
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		await setProcessingError(payload.videoId, errorMessage);
+		throw new FatalError(errorMessage);
+	}
 }
 
-async function downloadLoomToS3(payload: ImportLoomPayload): Promise<void> {
+function getInputExtension(url: string): string | undefined {
+	const pathname = new URL(url).pathname.toLowerCase();
+
+	if (pathname.endsWith(".m3u8")) {
+		return ".m3u8";
+	}
+
+	if (pathname.endsWith(".mpd")) {
+		return ".mpd";
+	}
+
+	if (pathname.endsWith(".mp4")) {
+		return ".mp4";
+	}
+
+	return undefined;
+}
+
+async function downloadLoomToS3(
+	payload: ImportLoomPayload,
+): Promise<LoomProcessingInput> {
 	"use step";
 
-	const { videoId, loomVideoId, rawFileKey, bucketId } = payload;
+	const { videoId, loomVideoId, rawFileKey } = payload;
 
 	await db()
 		.update(videoUploads)
@@ -406,18 +205,52 @@ async function downloadLoomToS3(payload: ImportLoomPayload): Promise<void> {
 
 	const freshDownloadUrl = await fetchFreshLoomDownloadUrl(loomVideoId);
 
-	const bucketIdOption = Option.fromNullable(bucketId).pipe(
-		Option.map((id) => S3Bucket.S3BucketId.make(id)),
-	);
+	if (isStreamingUrl(freshDownloadUrl)) {
+		await db()
+			.update(videoUploads)
+			.set({
+				phase: "processing",
+				processingProgress: 0,
+				processingMessage: "Starting video processing...",
+				updatedAt: new Date(),
+			})
+			.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+
+		return {
+			sourceVideoUrl: freshDownloadUrl,
+			inputExtension: getInputExtension(freshDownloadUrl),
+		};
+	}
 
 	const presignedPutUrl = await Effect.gen(function* () {
-		const [bucket] = yield* S3Buckets.getBucketAccess(bucketIdOption);
-		return yield* bucket.getInternalPresignedPutUrl(rawFileKey, {
-			ContentType: "video/mp4",
+		const [video] = yield* Effect.promise(() =>
+			db()
+				.select()
+				.from(videos)
+				.where(eq(videos.id, Video.VideoId.make(videoId))),
+		);
+		if (!video) {
+			return yield* Effect.fail(new FatalError("Video does not exist"));
+		}
+		const videoDomain = Video.Video.decodeSync({
+			...video,
+			bucketId: video.bucket,
+			storageIntegrationId: video.storageIntegrationId,
+			createdAt: video.createdAt.toISOString(),
+			updatedAt: video.updatedAt.toISOString(),
+			metadata: video.metadata,
 		});
+		const [bucket] = yield* Storage.getAccessForVideo(videoDomain);
+		return yield* bucket.getInternalPresignedPutUrl(
+			rawFileKey,
+			{
+				ContentType: "video/mp4",
+			},
+			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
+		);
 	}).pipe(runPromise);
 
-	const videoBuffer = await downloadVideoContent(freshDownloadUrl, loomVideoId);
+	const videoBuffer = await downloadVideoContent(freshDownloadUrl);
 
 	if (videoBuffer.length < MINIMUM_VIDEO_SIZE) {
 		throw new FatalError(
@@ -425,13 +258,19 @@ async function downloadLoomToS3(payload: ImportLoomPayload): Promise<void> {
 		);
 	}
 
+	const uploadHeaders: Record<string, string> = {
+		"Content-Type": "video/mp4",
+		"Content-Length": videoBuffer.length.toString(),
+	};
+	if (isGoogleDriveResumableUrl(presignedPutUrl) && videoBuffer.length > 0) {
+		uploadHeaders["Content-Range"] =
+			`bytes 0-${videoBuffer.length - 1}/${videoBuffer.length}`;
+	}
+
 	const uploadResponse = await fetch(presignedPutUrl, {
 		method: "PUT",
 		body: new Uint8Array(videoBuffer),
-		headers: {
-			"Content-Type": "video/mp4",
-			"Content-Length": videoBuffer.length.toString(),
-		},
+		headers: uploadHeaders,
 	});
 
 	if (!uploadResponse.ok) {
@@ -449,6 +288,8 @@ async function downloadLoomToS3(payload: ImportLoomPayload): Promise<void> {
 			updatedAt: new Date(),
 		})
 		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+
+	return {};
 }
 
 interface MediaServerProcessResult {
@@ -460,12 +301,75 @@ interface MediaServerProcessResult {
 	};
 }
 
+async function waitForRetry(delayMs: number): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function startMediaServerProcessJob(
+	mediaServerUrl: string,
+	body: {
+		videoId: string;
+		userId: string;
+		videoUrl: string;
+		outputPresignedUrl: string;
+		thumbnailPresignedUrl: string;
+		previewGifPresignedUrl: string;
+		webhookUrl: string;
+		webhookSecret?: string;
+		inputExtension?: string;
+	},
+): Promise<string> {
+	for (let attempt = 0; attempt < MEDIA_SERVER_START_MAX_ATTEMPTS; attempt++) {
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+		};
+		if (body.webhookSecret) {
+			headers["x-media-server-secret"] = body.webhookSecret;
+		}
+
+		const response = await fetch(`${mediaServerUrl}/video/process`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+		});
+
+		if (response.ok) {
+			const { jobId } = (await response.json()) as { jobId: string };
+			return jobId;
+		}
+
+		const errorData = (await response.json().catch(() => ({}))) as {
+			error?: string;
+			code?: string;
+			details?: string;
+		};
+		const errorMessage =
+			errorData.error ||
+			errorData.details ||
+			"Video processing failed to start";
+		const shouldRetry =
+			response.status === 503 &&
+			(errorData.code === "SERVER_BUSY" ||
+				errorMessage.includes("Server is busy"));
+
+		if (shouldRetry && attempt < MEDIA_SERVER_START_MAX_ATTEMPTS - 1) {
+			await waitForRetry(MEDIA_SERVER_START_RETRY_BASE_MS * 2 ** attempt);
+			continue;
+		}
+
+		throw new Error(errorMessage);
+	}
+
+	throw new Error("Video processing failed to start");
+}
+
 async function processVideoOnMediaServer(
 	payload: ImportLoomPayload,
+	processingInput: LoomProcessingInput,
 ): Promise<MediaServerProcessResult> {
 	"use step";
 
-	const { videoId, userId, rawFileKey, bucketId } = payload;
+	const { videoId, userId, rawFileKey, loomVideoId } = payload;
 
 	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
 	if (!mediaServerUrl) {
@@ -475,110 +379,199 @@ async function processVideoOnMediaServer(
 	const webhookBaseUrl =
 		serverEnv().MEDIA_SERVER_WEBHOOK_URL || serverEnv().WEB_URL;
 
-	const bucketIdOption = Option.fromNullable(bucketId).pipe(
-		Option.map((id) => S3Bucket.S3BucketId.make(id)),
-	);
+	const {
+		rawVideoUrl,
+		outputPresignedUrl,
+		thumbnailPresignedUrl,
+		previewGifPresignedUrl,
+	} = await Effect.gen(function* () {
+		const [video] = yield* Effect.promise(() =>
+			db()
+				.select()
+				.from(videos)
+				.where(eq(videos.id, Video.VideoId.make(videoId))),
+		);
+		if (!video) {
+			return yield* Effect.fail(new FatalError("Video does not exist"));
+		}
+		const videoDomain = Video.Video.decodeSync({
+			...video,
+			bucketId: video.bucket,
+			storageIntegrationId: video.storageIntegrationId,
+			createdAt: video.createdAt.toISOString(),
+			updatedAt: video.updatedAt.toISOString(),
+			metadata: video.metadata,
+		});
+		const [bucket] = yield* Storage.getAccessForVideo(videoDomain);
 
-	const { rawVideoUrl, outputPresignedUrl, thumbnailPresignedUrl } =
-		await Effect.gen(function* () {
-			const [bucket] = yield* S3Buckets.getBucketAccess(bucketIdOption);
+		const outputKey = `${userId}/${videoId}/result.mp4`;
+		const thumbnailKey = `${userId}/${videoId}/screenshot/screen-capture.jpg`;
+		const previewGifKey = `${userId}/${videoId}/preview/animated-preview.gif`;
 
-			const outputKey = `${userId}/${videoId}/result.mp4`;
-			const thumbnailKey = `${userId}/${videoId}/screenshot/screen-capture.jpg`;
+		const rawVideoUrl = yield* bucket.getInternalSignedObjectUrl(rawFileKey, {
+			expiresIn: MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS,
+		});
 
-			const rawVideoUrl = yield* bucket.getInternalSignedObjectUrl(rawFileKey);
-
-			const outputPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
-				outputKey,
-				{ ContentType: "video/mp4" },
-			);
-
-			const thumbnailPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
-				thumbnailKey,
-				{
-					ContentType: "image/jpeg",
-				},
-			);
-
-			return { rawVideoUrl, outputPresignedUrl, thumbnailPresignedUrl };
-		}).pipe(runPromise);
-
-	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress`;
-
-	const response = await fetch(`${mediaServerUrl}/video/process`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			videoId,
-			userId,
-			videoUrl: rawVideoUrl,
-			outputPresignedUrl,
-			thumbnailPresignedUrl,
-			webhookUrl,
-		}),
-	});
-
-	if (!response.ok) {
-		const errorData = (await response.json().catch(() => ({}))) as {
-			error?: string;
-		};
-		throw new Error(errorData.error || "Video processing failed to start");
-	}
-
-	const { jobId } = (await response.json()) as { jobId: string };
-
-	return await pollForCompletion(mediaServerUrl, jobId);
-}
-
-async function pollForCompletion(
-	mediaServerUrl: string,
-	jobId: string,
-): Promise<MediaServerProcessResult> {
-	const maxAttempts = 360;
-	const pollIntervalMs = 5000;
-
-	for (let attempt = 0; attempt < maxAttempts; attempt++) {
-		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-
-		const response = await fetch(
-			`${mediaServerUrl}/video/process/${jobId}/status`,
-			{
-				method: "GET",
-				headers: { Accept: "application/json" },
-			},
+		const outputPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
+			outputKey,
+			{ ContentType: "video/mp4" },
+			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		);
 
-		if (!response.ok) continue;
+		const thumbnailPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
+			thumbnailKey,
+			{
+				ContentType: "image/jpeg",
+			},
+			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
+		);
 
-		const status = (await response.json()) as {
-			phase: string;
-			progress: number;
-			error?: string;
-			metadata?: {
-				duration: number;
-				width: number;
-				height: number;
-				fps: number;
-			};
+		const previewGifPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
+			previewGifKey,
+			{
+				ContentType: "image/gif",
+				CacheControl: "public, max-age=31536000, immutable",
+			},
+			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
+		);
+
+		return {
+			rawVideoUrl,
+			outputPresignedUrl,
+			thumbnailPresignedUrl,
+			previewGifPresignedUrl,
 		};
+	}).pipe(runPromise);
 
-		if (status.phase === "complete") {
-			if (!status.metadata) {
-				throw new Error("Processing completed but no metadata returned");
-			}
-			return { metadata: status.metadata };
-		}
+	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress?retryable=true`;
+	const webhookSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
+	const sourceVideoUrl = processingInput.sourceVideoUrl
+		? await fetchFreshLoomDownloadUrl(loomVideoId)
+		: rawVideoUrl;
+	const inputExtension = processingInput.sourceVideoUrl
+		? getInputExtension(sourceVideoUrl)
+		: processingInput.inputExtension;
 
-		if (status.phase === "error") {
-			throw new Error(status.error || "Video processing failed");
-		}
+	await db()
+		.update(videoUploads)
+		.set({
+			phase: "processing",
+			processingProgress: 0,
+			processingMessage: "Starting video processing...",
+			processingError: null,
+			updatedAt: new Date(),
+		})
+		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
 
-		if (status.phase === "cancelled") {
-			throw new Error("Video processing was cancelled");
-		}
+	await startMediaServerProcessJob(mediaServerUrl, {
+		videoId,
+		userId,
+		videoUrl: sourceVideoUrl,
+		outputPresignedUrl,
+		thumbnailPresignedUrl,
+		previewGifPresignedUrl,
+		webhookUrl,
+		webhookSecret: webhookSecret || undefined,
+		inputExtension,
+	});
+
+	return await waitForProcessingCompletion(videoId);
+}
+
+function getMetadataFromVideoRow(
+	video:
+		| {
+				duration: number | null;
+				width: number | null;
+				height: number | null;
+				fps: number | null;
+		  }
+		| undefined,
+): MediaServerProcessResult["metadata"] | null {
+	if (
+		!video ||
+		!isPositiveNumber(video.width) ||
+		!isPositiveNumber(video.height) ||
+		!isPositiveNumber(video.fps)
+	) {
+		return null;
 	}
 
-	throw new Error("Video processing timed out");
+	return {
+		duration: isPositiveNumber(video.duration) ? video.duration : 0,
+		width: video.width,
+		height: video.height,
+		fps: video.fps,
+	};
+}
+
+async function getCompletedMetadata(
+	videoId: string,
+): Promise<MediaServerProcessResult["metadata"] | null> {
+	const [video] = await db()
+		.select({
+			duration: videos.duration,
+			width: videos.width,
+			height: videos.height,
+			fps: videos.fps,
+		})
+		.from(videos)
+		.where(eq(videos.id, videoId as Video.VideoId));
+
+	return getMetadataFromVideoRow(video);
+}
+
+async function waitForProcessingCompletion(
+	videoId: string,
+): Promise<MediaServerProcessResult> {
+	let lastStatus = "processing";
+
+	for (
+		let attempt = 0;
+		attempt < MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS;
+		attempt++
+	) {
+		await waitForRetry(MEDIA_SERVER_COMPLETION_POLL_INTERVAL_MS);
+
+		const [upload] = await db()
+			.select({
+				phase: videoUploads.phase,
+				processingProgress: videoUploads.processingProgress,
+				processingMessage: videoUploads.processingMessage,
+				processingError: videoUploads.processingError,
+			})
+			.from(videoUploads)
+			.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+
+		if (!upload || upload.phase === "complete") {
+			const metadata = await getCompletedMetadata(videoId);
+			if (!metadata) {
+				throw new Error("Processing completed but video metadata is missing");
+			}
+
+			return { metadata };
+		}
+
+		if (upload.processingError) {
+			throw new Error(upload.processingError);
+		}
+
+		if (upload.phase === "error") {
+			throw new Error(upload.processingMessage || "Loom import failed");
+		}
+
+		lastStatus = [
+			upload.phase,
+			typeof upload.processingProgress === "number"
+				? `${upload.processingProgress}%`
+				: null,
+			upload.processingMessage,
+		]
+			.filter(Boolean)
+			.join(" ");
+	}
+
+	throw new Error(`Video processing timed out while ${lastStatus}`);
 }
 
 async function saveMetadataAndComplete(
@@ -592,11 +585,32 @@ async function saveMetadataAndComplete(
 		.set({
 			width: metadata.width,
 			height: metadata.height,
-			duration: metadata.duration,
+			fps: metadata.fps,
+			...(getValidDuration(metadata.duration) === undefined
+				? {}
+				: { duration: metadata.duration }),
 		})
 		.where(eq(videos.id, videoId as Video.VideoId));
 
 	await db()
 		.delete(videoUploads)
+		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+}
+
+async function setProcessingError(
+	videoId: string,
+	errorMessage: string,
+): Promise<void> {
+	"use step";
+
+	await db()
+		.update(videoUploads)
+		.set({
+			phase: "error",
+			processingProgress: 0,
+			processingMessage: "Loom import failed",
+			processingError: errorMessage,
+			updatedAt: new Date(),
+		})
 		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
 }

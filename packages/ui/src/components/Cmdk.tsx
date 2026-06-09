@@ -7,7 +7,46 @@ import { Search } from "lucide-react";
 import * as React from "react";
 import { Dialog, DialogContent } from "./Dialog";
 
-const Command = React.forwardRef<
+type ForwardRefComponent<TElement, TProps> = React.ForwardRefExoticComponent<
+	TProps & React.RefAttributes<TElement>
+>;
+
+type CommandComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive>
+>;
+
+type CommandInputComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive.Input>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Input>
+>;
+
+type CommandListComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive.List>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive.List>
+>;
+
+type CommandEmptyComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive.Empty>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Empty>
+>;
+
+type CommandGroupComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive.Group>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Group>
+>;
+
+type CommandSeparatorComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive.Separator>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Separator>
+>;
+
+type CommandItemComponent = ForwardRefComponent<
+	React.ElementRef<typeof CommandPrimitive.Item>,
+	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Item>
+>;
+
+const Command: CommandComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive>
 >(({ className, ...props }, ref) => (
@@ -28,7 +67,7 @@ const CommandDialog = ({ children, ...props }: CommandDialogProps) => {
 	return (
 		<Dialog {...props}>
 			<DialogContent className="overflow-hidden p-0 shadow-lg">
-				<Command className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-group]]:px-2 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 [&_[cmdk-input]]:h-12 [&_[cmdk-item]]:px-2 [&_[cmdk-item]]:py-3 [&_[cmdk-item]_svg]:h-5 [&_[cmdk-item]_svg]:w-5">
+				<Command className="**:[[cmdk-group-heading]]:px-2 **:[[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 **:[[cmdk-group]]:px-2 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 **:[[cmdk-input]]:h-12 **:[[cmdk-item]]:px-2 **:[[cmdk-item]]:py-3 [&_[cmdk-item]_svg]:h-5 [&_[cmdk-item]_svg]:w-5">
 					{children}
 				</Command>
 			</DialogContent>
@@ -36,7 +75,7 @@ const CommandDialog = ({ children, ...props }: CommandDialogProps) => {
 	);
 };
 
-const CommandInput = React.forwardRef<
+const CommandInput: CommandInputComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive.Input>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Input>
 >(({ className, ...props }, ref) => (
@@ -48,7 +87,7 @@ const CommandInput = React.forwardRef<
 		<CommandPrimitive.Input
 			ref={ref}
 			className={classNames(
-				"flex py-3 w-full h-11 text-sm bg-transparent rounded-md outline-none text-gray-12 placeholder:text-gray-10 disabled:cursor-not-allowed disabled:opacity-50",
+				"flex py-3 w-full h-11 text-sm bg-transparent rounded-md outline-hidden text-gray-12 placeholder:text-gray-10 disabled:cursor-not-allowed disabled:opacity-50",
 				className,
 			)}
 			{...props}
@@ -58,7 +97,7 @@ const CommandInput = React.forwardRef<
 
 CommandInput.displayName = CommandPrimitive.Input.displayName;
 
-const CommandList = React.forwardRef<
+const CommandList: CommandListComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive.List>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive.List>
 >(({ className, ...props }, ref) => (
@@ -74,7 +113,7 @@ const CommandList = React.forwardRef<
 
 CommandList.displayName = CommandPrimitive.List.displayName;
 
-const CommandEmpty = React.forwardRef<
+const CommandEmpty: CommandEmptyComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive.Empty>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Empty>
 >((props, ref) => (
@@ -87,14 +126,14 @@ const CommandEmpty = React.forwardRef<
 
 CommandEmpty.displayName = CommandPrimitive.Empty.displayName;
 
-const CommandGroup = React.forwardRef<
+const CommandGroup: CommandGroupComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive.Group>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Group>
 >(({ className, ...props }, ref) => (
 	<CommandPrimitive.Group
 		ref={ref}
 		className={classNames(
-			"overflow-hidden p-1 text-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground",
+			"overflow-hidden p-1 text-foreground **:[[cmdk-group-heading]]:px-2 **:[[cmdk-group-heading]]:py-1.5 **:[[cmdk-group-heading]]:text-xs **:[[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground",
 			className,
 		)}
 		{...props}
@@ -103,7 +142,7 @@ const CommandGroup = React.forwardRef<
 
 CommandGroup.displayName = CommandPrimitive.Group.displayName;
 
-const CommandSeparator = React.forwardRef<
+const CommandSeparator: CommandSeparatorComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive.Separator>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Separator>
 >(({ className, ...props }, ref) => (
@@ -115,14 +154,14 @@ const CommandSeparator = React.forwardRef<
 ));
 CommandSeparator.displayName = CommandPrimitive.Separator.displayName;
 
-const CommandItem = React.forwardRef<
+const CommandItem: CommandItemComponent = React.forwardRef<
 	React.ElementRef<typeof CommandPrimitive.Item>,
 	React.ComponentPropsWithoutRef<typeof CommandPrimitive.Item>
 >(({ className, ...props }, ref) => (
 	<CommandPrimitive.Item
 		ref={ref}
 		className={classNames(
-			"relative flex cursor-pointer text-gray-8 select-none items-center rounded-sm px-2 py-2 text-[0.875rem] outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+			"relative flex cursor-pointer text-gray-8 select-none items-center rounded-xs px-2 py-2 text-[0.875rem] outline-hidden data-disabled:pointer-events-none data-disabled:opacity-50",
 			className,
 		)}
 		{...props}

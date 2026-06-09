@@ -1,3 +1,5 @@
+import { describe, expect, it } from "vitest";
+
 const MICRO_CREDITS_PER_DOLLAR = 100_000;
 const MICRO_CREDITS_PER_MINUTE = 5_000;
 const MICRO_CREDITS_PER_MINUTE_PER_DAY = 3.33;
@@ -21,6 +23,10 @@ function balanceDollars(balanceMicroCredits: number): string {
 
 function balanceAfterCharge(balance: number, charge: number): number {
 	return Math.max(0, balance - charge);
+}
+
+function isBelowMinimumPurchase(amountCents: number): boolean {
+	return amountCents < 500;
 }
 
 describe("Purchase Credits Conversion", () => {
@@ -50,9 +56,9 @@ describe("Purchase Credits Conversion", () => {
 	});
 
 	it("rejects purchases below $5.00 minimum (amountCents < 500)", () => {
-		expect(499 < 500).toBe(true);
-		expect(500 < 500).toBe(false);
-		expect(0 < 500).toBe(true);
+		expect(isBelowMinimumPurchase(499)).toBe(true);
+		expect(isBelowMinimumPurchase(500)).toBe(false);
+		expect(isBelowMinimumPurchase(0)).toBe(true);
 	});
 });
 

@@ -1,5 +1,4 @@
 use std::{
-    env::temp_dir,
     fmt,
     ops::{Add, Div, Mul, Sub, SubAssign},
     path::Path,
@@ -41,6 +40,14 @@ pub enum BackgroundSource {
         to: Color,
         #[serde(default = "default_gradient_angle")]
         angle: u16,
+        #[serde(default)]
+        noise_intensity: Option<f32>,
+        #[serde(default)]
+        noise_scale: Option<f32>,
+        #[serde(default)]
+        animated: Option<bool>,
+        #[serde(default)]
+        animation_speed: Option<f32>,
     },
 }
 
@@ -288,6 +295,35 @@ pub struct CameraPosition {
     pub y: CameraYPosition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundBlurMode {
+    #[default]
+    Off,
+    Light,
+    Heavy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BackgroundBlurConfig {
+    pub mode: BackgroundBlurMode,
+}
+
+impl BackgroundBlurConfig {
+    pub fn is_active(&self) -> bool {
+        self.mode != BackgroundBlurMode::Off
+    }
+}
+
+impl Default for BackgroundBlurConfig {
+    fn default() -> Self {
+        Self {
+            mode: BackgroundBlurMode::Off,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Camera {
@@ -306,6 +342,8 @@ pub struct Camera {
     pub rounding_type: CornerStyle,
     #[serde(default = "Camera::default_scale_during_zoom")]
     pub scale_during_zoom: f32,
+    #[serde(default)]
+    pub background_blur: BackgroundBlurConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
@@ -348,6 +386,7 @@ impl Default for Camera {
             shape: CameraShape::Square,
             rounding_type: CornerStyle::default(),
             scale_during_zoom: Self::default_scale_during_zoom(),
+            background_blur: BackgroundBlurConfig::default(),
         }
     }
 }
@@ -406,9 +445,11 @@ pub enum CursorType {
 #[serde(rename_all = "camelCase")]
 pub enum CursorAnimationStyle {
     Slow,
+    Smooth,
     #[default]
-    #[serde(alias = "regular", alias = "quick", alias = "rapid", alias = "fast")]
+    #[serde(alias = "regular", alias = "quick", alias = "rapid")]
     Mellow,
+    Fast,
     Custom,
 }
 
@@ -430,9 +471,9 @@ pub struct ClickSpringConfig {
 impl Default for ClickSpringConfig {
     fn default() -> Self {
         Self {
-            tension: 700.0,
+            tension: 530.0,
             mass: 1.0,
-            friction: 30.0,
+            friction: 40.0,
         }
     }
 }
@@ -463,10 +504,20 @@ impl CursorAnimationStyle {
                 mass: 2.25,
                 friction: 40.0,
             }),
+            Self::Smooth => Some(CursorSmoothingPreset {
+                tension: 80.0,
+                mass: 2.5,
+                friction: 28.0,
+            }),
             Self::Mellow => Some(CursorSmoothingPreset {
                 tension: 470.0,
                 mass: 3.0,
                 friction: 70.0,
+            }),
+            Self::Fast => Some(CursorSmoothingPreset {
+                tension: 380.0,
+                mass: 1.0,
+                friction: 30.0,
             }),
             Self::Custom => None,
         }
@@ -505,7 +556,7 @@ impl Default for CursorConfiguration {
             hide: false,
             hide_when_idle: false,
             hide_when_idle_delay: Self::default_hide_when_idle_delay(),
-            size: 150,
+            size: 100,
             r#type: CursorType::default(),
             animation_style,
             tension: 470.0,
@@ -535,7 +586,7 @@ impl CursorConfiguration {
     }
 
     fn default_rotation_amount() -> f32 {
-        0.5
+        0.15
     }
 
     pub fn cursor_type(&self) -> &CursorType {
@@ -661,6 +712,8 @@ pub struct MaskKeyframes {
 pub struct MaskSegment {
     pub start: f64,
     pub end: f64,
+    #[serde(default)]
+    pub track: u32,
     #[serde(default = "MaskSegment::default_enabled")]
     pub enabled: bool,
     pub mask_type: MaskKind,
@@ -699,6 +752,8 @@ impl MaskSegment {
 pub struct TextSegment {
     pub start: f64,
     pub end: f64,
+    #[serde(default)]
+    pub track: u32,
     #[serde(default = "TextSegment::default_enabled")]
     pub enabled: bool,
     #[serde(default = "TextSegment::default_content")]
@@ -766,6 +821,31 @@ pub enum SceneMode {
     Default,
     CameraOnly,
     HideCamera,
+    SplitScreen,
+}
+
+#[derive(Type, Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SplitLayout {
+    pub screen_zoom: f64,
+    pub screen_position: XY<f64>,
+    pub camera_zoom: f64,
+    pub camera_position: XY<f64>,
+}
+
+impl Default for SplitLayout {
+    fn default() -> Self {
+        Self {
+            screen_zoom: 1.0,
+            screen_position: XY::new(0.5, 0.5),
+            camera_zoom: 1.0,
+            camera_position: XY::new(0.5, 0.5),
+        }
+    }
+}
+
+fn default_scene_transition() -> f64 {
+    0.3
 }
 
 #[derive(Type, Serialize, Deserialize, Clone, Debug)]
@@ -775,6 +855,12 @@ pub struct SceneSegment {
     pub end: f64,
     #[serde(default)]
     pub mode: SceneMode,
+    #[serde(default)]
+    pub split_layout: Option<SplitLayout>,
+    #[serde(default = "default_scene_transition")]
+    pub transition_in: f64,
+    #[serde(default = "default_scene_transition")]
+    pub transition_out: f64,
 }
 
 #[derive(Type, Serialize, Deserialize, Clone, Debug)]
@@ -788,6 +874,33 @@ pub struct TimelineConfiguration {
     pub mask_segments: Vec<MaskSegment>,
     #[serde(default)]
     pub text_segments: Vec<TextSegment>,
+    #[serde(default)]
+    pub caption_segments: Vec<CaptionTrackSegment>,
+    #[serde(default)]
+    pub keyboard_segments: Vec<crate::KeyboardTrackSegment>,
+}
+
+#[derive(Type, Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionTrackSegment {
+    pub id: String,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    #[serde(default)]
+    pub words: Vec<CaptionWord>,
+    #[serde(default)]
+    pub fade_duration_override: Option<f32>,
+    #[serde(default)]
+    pub linger_duration_override: Option<f32>,
+    #[serde(default)]
+    pub position_override: Option<String>,
+    #[serde(default)]
+    pub color_override: Option<String>,
+    #[serde(default)]
+    pub background_color_override: Option<String>,
+    #[serde(default)]
+    pub font_size_override: Option<u32>,
 }
 
 impl TimelineConfiguration {
@@ -909,7 +1022,7 @@ impl Default for CaptionSettings {
             enabled: false,
             font: "System Sans-Serif".to_string(),
             size: 24,
-            color: "#A0A0A0".to_string(),
+            color: "#FFFFFF".to_string(),
             background_color: "#000000".to_string(),
             background_opacity: 90,
             position: "bottom-center".to_string(),
@@ -932,6 +1045,52 @@ impl Default for CaptionSettings {
 pub struct CaptionsData {
     pub segments: Vec<CaptionSegment>,
     pub settings: CaptionSettings,
+}
+
+#[derive(Type, Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KeyboardSettings {
+    pub enabled: bool,
+    pub font: String,
+    pub size: u32,
+    pub color: String,
+    pub background_color: String,
+    pub background_opacity: u32,
+    pub position: String,
+    pub font_weight: u32,
+    pub fade_duration: f32,
+    pub linger_duration: f32,
+    pub grouping_threshold_ms: f64,
+    pub show_modifiers: bool,
+    pub show_special_keys: bool,
+    pub uppercase: bool,
+}
+
+impl Default for KeyboardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            font: "System Sans-Serif".to_string(),
+            size: 50,
+            color: "#FFFFFF".to_string(),
+            background_color: "#000000".to_string(),
+            background_opacity: 95,
+            position: "bottom-center".to_string(),
+            font_weight: 400,
+            fade_duration: 0.15,
+            linger_duration: 0.8,
+            grouping_threshold_ms: 500.0,
+            show_modifiers: true,
+            show_special_keys: true,
+            uppercase: false,
+        }
+    }
+}
+
+#[derive(Type, Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyboardData {
+    pub settings: KeyboardSettings,
 }
 
 #[derive(Type, Serialize, Deserialize, Clone, Copy, Debug, Default)]
@@ -1072,7 +1231,7 @@ impl Annotation {
     }
 }
 
-#[derive(Type, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Type, Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectConfiguration {
     pub aspect_ratio: Option<AspectRatio>,
@@ -1083,6 +1242,7 @@ pub struct ProjectConfiguration {
     pub hotkeys: HotkeysConfiguration,
     pub timeline: Option<TimelineConfiguration>,
     pub captions: Option<CaptionsData>,
+    pub keyboard: Option<KeyboardData>,
     pub clips: Vec<ClipConfiguration>,
     pub annotations: Vec<Annotation>,
     #[serde(skip_serializing)]
@@ -1104,6 +1264,27 @@ fn camera_config_needs_migration(value: &Value) -> bool {
         })
 }
 
+impl Default for ProjectConfiguration {
+    fn default() -> Self {
+        Self {
+            aspect_ratio: Default::default(),
+            background: Default::default(),
+            camera: Default::default(),
+            audio: Default::default(),
+            cursor: Default::default(),
+            hotkeys: Default::default(),
+            timeline: Default::default(),
+            captions: Default::default(),
+            keyboard: Default::default(),
+            clips: Default::default(),
+            annotations: Default::default(),
+            hidden_text_segments: Default::default(),
+            screen_motion_blur: Self::default_screen_motion_blur(),
+            screen_movement_spring: Default::default(),
+        }
+    }
+}
+
 impl ProjectConfiguration {
     fn default_screen_motion_blur() -> f32 {
         0.5
@@ -1122,20 +1303,38 @@ impl ProjectConfiguration {
         let config_path = project_path.join("project-config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
         let parsed_value = serde_json::from_str::<Value>(&config_str).ok();
-        let config: Self = serde_json::from_str(&config_str)
+        let missing_screen_motion_blur = parsed_value.as_ref().is_some_and(|value| {
+            value
+                .as_object()
+                .is_some_and(|object| !object.contains_key("screenMotionBlur"))
+        });
+        let needs_camera_migration = parsed_value
+            .as_ref()
+            .map(camera_config_needs_migration)
+            .unwrap_or(false);
+        let mut config: Self = serde_json::from_str(&config_str)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let cursor_motion_blur = config.cursor.motion_blur.clamp(0.0, 1.0);
+        let screen_motion_blur = config.screen_motion_blur.clamp(0.0, 1.0);
+        let needs_motion_blur_clamp = (config.cursor.motion_blur - cursor_motion_blur).abs()
+            > f32::EPSILON
+            || (config.screen_motion_blur - screen_motion_blur).abs() > f32::EPSILON;
+        let needs_screen_motion_blur_migration = missing_screen_motion_blur
+            || (screen_motion_blur - cursor_motion_blur).abs() > f32::EPSILON;
+        config.cursor.motion_blur = cursor_motion_blur;
+        if needs_screen_motion_blur_migration {
+            config.screen_motion_blur = config.cursor.motion_blur;
+        } else {
+            config.screen_motion_blur = screen_motion_blur;
+        }
         config
             .validate()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
-        if parsed_value
-            .as_ref()
-            .map(camera_config_needs_migration)
-            .unwrap_or(false)
-        {
+        if needs_camera_migration || needs_motion_blur_clamp || needs_screen_motion_blur_migration {
             match config.write(project_path) {
                 Ok(_) => {
-                    eprintln!("Updated project-config.json camera keys to camelCase");
+                    eprintln!("Updated project-config.json migrated settings");
                 }
                 Err(error) => {
                     eprintln!("Failed to migrate project-config.json: {error}");
@@ -1150,15 +1349,17 @@ impl ProjectConfiguration {
         self.validate()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
-        let temp_path = temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let project_path = project_path.as_ref();
+        let config_path = project_path.join("project-config.json");
+        let temp_path =
+            project_path.join(format!(".project-config-{}.json.tmp", uuid::Uuid::new_v4()));
 
-        // Write to temporary file first to ensure readers don't see partial files
         std::fs::write(&temp_path, serde_json::to_string_pretty(self)?)?;
 
-        std::fs::rename(
-            &temp_path,
-            project_path.as_ref().join("project-config.json"),
-        )?;
+        if let Err(error) = std::fs::rename(&temp_path, &config_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -1177,3 +1378,78 @@ pub const FAST_SMOOTHING_SAMPLES: usize = 10;
 pub const SLOW_VELOCITY_THRESHOLD: f64 = 0.003;
 pub const REGULAR_VELOCITY_THRESHOLD: f64 = 0.008;
 pub const FAST_VELOCITY_THRESHOLD: f64 = 0.015;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config_with_motion_blur_values(
+        project_path: &std::path::Path,
+        cursor_motion_blur: f64,
+        screen_motion_blur: Option<f64>,
+    ) {
+        let mut value = serde_json::to_value(ProjectConfiguration::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        match screen_motion_blur {
+            Some(value) => {
+                object.insert("screenMotionBlur".to_string(), Value::from(value));
+            }
+            None => {
+                object.remove("screenMotionBlur");
+            }
+        }
+        object
+            .get_mut("cursor")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("motionBlur".to_string(), Value::from(cursor_motion_blur));
+
+        std::fs::write(
+            project_path.join("project-config.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_motion_blur_is_half() {
+        let config = ProjectConfiguration::default();
+
+        assert_eq!(config.cursor.motion_blur, 0.5);
+        assert_eq!(config.screen_motion_blur, 0.5);
+    }
+
+    #[test]
+    fn load_uses_cursor_motion_blur_when_screen_motion_blur_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_with_motion_blur_values(dir.path(), 0.0, None);
+
+        let config = ProjectConfiguration::load(dir.path()).unwrap();
+
+        assert_eq!(config.cursor.motion_blur, 0.0);
+        assert_eq!(config.screen_motion_blur, 0.0);
+    }
+
+    #[test]
+    fn load_uses_cursor_motion_blur_when_screen_motion_blur_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_with_motion_blur_values(dir.path(), 0.0, Some(1.0));
+
+        let config = ProjectConfiguration::load(dir.path()).unwrap();
+
+        assert_eq!(config.cursor.motion_blur, 0.0);
+        assert_eq!(config.screen_motion_blur, 0.0);
+    }
+
+    #[test]
+    fn load_caps_motion_blur_to_slider_range() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_with_motion_blur_values(dir.path(), 2.0, Some(2.0));
+
+        let config = ProjectConfiguration::load(dir.path()).unwrap();
+
+        assert_eq!(config.cursor.motion_blur, 1.0);
+        assert_eq!(config.screen_motion_blur, 1.0);
+    }
+}

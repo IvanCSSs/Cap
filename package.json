@@ -7,6 +7,7 @@
 		"cap-setup": "dotenv -e .env -- node scripts/setup.js",
 		"analytics:migrate-dub": "dotenv -e .env -- node scripts/analytics/migrate-dub-to-tinybird.js --dry-run",
 		"analytics:migrate-dub:apply": "dotenv -e .env -- node scripts/analytics/migrate-dub-to-tinybird.js --apply",
+		"analytics:posthog-growth": "dotenv -e .env -- node scripts/analytics/posthog-growth-audit.mjs",
 		"analytics:setup": "dotenv -e .env -- node scripts/analytics/setup-analytics.js",
 		"analytics:check": "dotenv -e .env -- node scripts/analytics/check-analytics.js",
 		"analytics:delete-all": "dotenv -e .env -- node scripts/analytics/delete-all-data.js",
@@ -24,8 +25,8 @@
 		"docker:up": "turbo run docker:up",
 		"format": "pnpm exec biome check --write",
 		"lint": "pnpm exec biome lint",
-		"tauri:build": "dotenv -e .env -- pnpm --dir apps/desktop tauri build --verbose",
-		"typecheck": "pnpm tsc -b",
+		"tauri:build": "node scripts/build-desktop-binaries.mjs && dotenv -e .env -- pnpm --dir apps/desktop run preparescript && dotenv -e .env -- pnpm --dir apps/desktop tauri build --verbose",
+		"typecheck": "pnpm --dir apps/web exec next typegen && pnpm tsc -b",
 		"test": "turbo run test",
 		"test:web": "pnpm --filter=@cap/web test",
 		"test:discover": "pnpm with-env cargo run -p cap-test -- discover",
@@ -38,6 +39,8 @@
 		"test:suite:encoding": "pnpm with-env cargo run -p cap-test -- suite encoding",
 		"test:suite:playback": "pnpm with-env cargo run -p cap-test -- suite playback",
 		"test:suite:sync": "pnpm with-env cargo run -p cap-test -- suite sync",
+		"test:desktop:memory": "pnpm --dir apps/desktop test:memory",
+		"test:desktop:memory:unit": "pnpm --dir apps/desktop test:memory:unit",
 		"web": "pnpm --filter=@cap/web",
 		"env-setup": "node scripts/env-cli.js",
 		"check-tauri-versions": "node scripts/check-tauri-plugin-versions.js",
@@ -54,6 +57,13 @@
 		"tsdown": "^0.15.6",
 		"turbo": "^2.3.4",
 		"typescript": "^5.8.3"
+	},
+	"pnpm": {
+		"peerDependencyRules": {
+			"allowedVersions": {
+				"next-auth>next": ">=16.0.0"
+			}
+		}
 	},
 	"packageManager": "pnpm@10.5.2",
 	"name": "cap",

@@ -34,6 +34,7 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 								Video.Video.decodeSync({
 									...v,
 									bucketId: v.bucket,
+									storageIntegrationId: v.storageIntegrationId,
 									createdAt: v.createdAt.toISOString(),
 									updatedAt: v.updatedAt.toISOString(),
 									metadata: v.metadata as any,
@@ -48,6 +49,7 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 			db.use(async (db) => {
 				await db.transaction(async (db) => {
 					await Promise.all([
+						db.delete(Db.importedVideos).where(Dz.eq(Db.importedVideos.id, id)),
 						db.delete(Db.videos).where(Dz.eq(Db.videos.id, id)),
 						db
 							.delete(Db.videoUploads)
@@ -69,6 +71,9 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 									id,
 									orgId: data.orgId,
 									bucket: Option.getOrNull(data.bucketId ?? Option.none()),
+									storageIntegrationId: Option.getOrNull(
+										data.storageIntegrationId ?? Option.none(),
+									),
 									metadata: Option.getOrNull(data.metadata ?? Option.none()),
 									transcriptionStatus: Option.getOrNull(
 										data.transcriptionStatus ?? Option.none(),

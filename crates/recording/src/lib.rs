@@ -1,11 +1,14 @@
 pub mod benchmark;
 mod capture_pipeline;
 pub mod cursor;
+pub mod defaults;
 pub mod diagnostics;
 pub mod feeds;
 pub mod fragmentation;
 pub mod instant_recording;
+pub mod memory_profiling;
 mod output_pipeline;
+pub mod output_validation;
 pub mod recovery;
 mod resolution_limits;
 pub mod screenshot;
@@ -18,7 +21,15 @@ pub use resolution_limits::{H264_MAX_DIMENSION, calculate_gpu_compatible_size};
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_sources;
 
+pub use defaults::{
+    CAMERA_ACTIVE_STUDIO_MAX_FPS, DEFAULT_CAPTURE_KEYBOARD_EVENTS,
+    DEFAULT_CRASH_RECOVERY_RECORDING, DEFAULT_CUSTOM_CURSOR_CAPTURE, DEFAULT_INSTANT_MODE_FPS,
+    DEFAULT_INSTANT_MODE_MAX_RESOLUTION, DEFAULT_OUT_OF_PROCESS_MUXER, DEFAULT_STUDIO_MAX_FPS,
+    FREE_INSTANT_MODE_MAX_RESOLUTION, PRO_INSTANT_MODE_MAX_RESOLUTION, RecordingDefaults,
+    default_studio_recording_quality,
+};
 pub use feeds::{camera::CameraFeed, microphone::MicrophoneFeed};
+pub use output_pipeline::oop_muxer;
 pub use output_pipeline::*;
 pub use sources::screen_capture;
 
@@ -34,10 +45,18 @@ use crate::{feeds::camera::CameraFeedLock, sources::screen_capture::ScreenCaptur
 #[derive(specta::Type, Serialize, Deserialize, Clone, Debug, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RecordingMode {
-    #[default]
     Studio,
+    #[default]
     Instant,
     Screenshot,
+}
+
+#[derive(Clone, Debug, Copy, Default, PartialEq, Eq)]
+pub enum StudioQuality {
+    Compatibility,
+    #[default]
+    Balanced,
+    Ultra,
 }
 
 #[derive(specta::Type, Serialize, Deserialize, Clone, Debug)]
@@ -131,4 +150,22 @@ pub enum RecordingError {
 
     #[error("IO/{0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum RecordingHealth {
+    Healthy,
+    Repaired { original_issue: String },
+    Degraded { issues: Vec<String> },
+    Damaged { reason: String },
+}
+
+impl RecordingHealth {
+    pub fn is_uploadable(&self) -> bool {
+        matches!(
+            self,
+            Self::Healthy | Self::Repaired { .. } | Self::Degraded { .. }
+        )
+    }
 }
