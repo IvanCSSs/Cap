@@ -17,6 +17,14 @@ Effect.gen(function* () {
 
 		if (pkgJson.publishConfig) {
 			pkgJson = { ...pkgJson, ...pkgJson.publishConfig };
+			// Strip src-pointing exports so Deno resolves the built dist/ JS instead
+			// of trying to type-strip .ts files in node_modules at runtime.
+			if (
+				pkgJson.exports &&
+				JSON.stringify(pkgJson.exports).includes("/src/")
+			) {
+				delete pkgJson.exports;
+			}
 		}
 
 		yield* fs.writeFileString(pkgJsonPath, JSON.stringify(pkgJson));
