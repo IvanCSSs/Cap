@@ -29,8 +29,13 @@ jobs:
         run: |
           git checkout main
           git merge upstream/main --no-edit -X theirs || true
-          # Re-apply our patches if there are conflicts
+          # Preserve our customizations
           git checkout HEAD -- apps/web/lib/transcribe.ts apps/web/lib/transcribe-direct.ts || true
+          # Preserve our workflows (GITHUB_TOKEN cannot push workflow changes)
+          git checkout HEAD -- .github/workflows/ || true
+          if ! git diff --quiet --cached; then
+            git commit --amend --no-edit
+          fi
 
       - name: Push changes
         run: git push origin main
