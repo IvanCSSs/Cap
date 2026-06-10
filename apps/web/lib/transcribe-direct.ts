@@ -73,26 +73,17 @@ function formatTime(ms: number): string {
 	return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${milliseconds.toString().padStart(3, "0")}`;
 }
 
-async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
+async function submitAssemblyAIJob(audioUrl: string): Promise<string> {
 	const apiKey = serverEnv().ASSEMBLYAI_API_KEY;
 	if (!apiKey) {
 		throw new Error("Missing ASSEMBLYAI_API_KEY");
 	}
 
-	const headers = {
-		"authorization": apiKey,
-		"content-type": "application/json",
-	};
-
-	// Submit transcription job with speaker diarization
 	console.log(`[transcribe-direct] Submitting to AssemblyAI...`);
 	const submitResponse = await fetch("https://api.assemblyai.com/v2/transcript", {
 		method: "POST",
-		headers,
-		body: JSON.stringify({
-			audio_url: audioUrl,
-			speaker_labels: true,  // Enable speaker diarization
-		}),
+		headers: { authorization: apiKey, "content-type": "application/json" },
+		body: JSON.stringify({ audio_url: audioUrl, speaker_labels: true }),
 	});
 
 	if (!submitResponse.ok) {
@@ -100,33 +91,47 @@ async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
 		throw new Error(`AssemblyAI submit failed: ${error}`);
 	}
 
-	const job = await submitResponse.json() as { id: string };
+	const job = (await submitResponse.json()) as { id: string };
 	console.log(`[transcribe-direct] AssemblyAI job ID: ${job.id}`);
+	return job.id;
+}
 
-	// Poll for completion
-	let result: AssemblyAIResult;
+async function pollAssemblyAIJob(jobId: string): Promise<string> {
+	const apiKey = serverEnv().ASSEMBLYAI_API_KEY;
+	if (!apiKey) {
+		throw new Error("Missing ASSEMBLYAI_API_KEY");
+	}
+
+	// Cap polling. If we run out of time, throw a recoverable timeout so the
+	// next share-page render resumes polling the same jobId from DB.
+	const deadline = Date.now() + 60_000;
+
 	while (true) {
-		await new Promise(resolve => setTimeout(resolve, 3000));
-		
-		const pollResponse = await fetch(`https://api.assemblyai.com/v2/transcript/${job.id}`, {
-			headers: { authorization: apiKey },
-		});
+		await new Promise((resolve) => setTimeout(resolve, 3000));
+
+		const pollResponse = await fetch(
+			`https://api.assemblyai.com/v2/transcript/${jobId}`,
+			{ headers: { authorization: apiKey } },
+		);
 
 		if (!pollResponse.ok) {
 			throw new Error(`AssemblyAI poll failed: ${pollResponse.status}`);
 		}
 
-		result = await pollResponse.json() as AssemblyAIResult;
+		const result = (await pollResponse.json()) as AssemblyAIResult;
 		console.log(`[transcribe-direct] AssemblyAI status: ${result.status}`);
 
 		if (result.status === "completed") {
-			break;
-		} else if (result.status === "error") {
+			return formatToWebVTT(result);
+		}
+		if (result.status === "error") {
 			throw new Error(`AssemblyAI error: ${result.error}`);
 		}
-	}
 
-	return formatToWebVTT(result);
+		if (Date.now() > deadline) {
+			throw new Error("ASSEMBLYAI_POLL_TIMEOUT");
+		}
+	}
 }
 
 async function getAccessibleVideoUrl(
@@ -200,6 +205,64 @@ export async function transcribeVideoDirect(
 		const result = query[0];
 		if (!result?.video) {
 			throw new Error("Video information is missing");
+		}
+
+		// Resume: if a previous attempt already submitted an AssemblyAI job,
+		// poll that one instead of re-extracting audio and re-submitting.
+		// This is what makes transcription idempotent across request timeouts.
+		const existingJobId = result.video.transcriptionJobId;
+		if (existingJobId && result.video.transcriptionStatus === "PROCESSING") {
+			console.log(
+				`[transcribe-direct] Resuming AssemblyAI job ${existingJobId} for video ${videoId}`,
+			);
+			try {
+				const transcription = await pollAssemblyAIJob(existingJobId);
+
+				// Need the bucket to write the transcript out.
+				const resumeBucketId = (result.bucket?.id ?? null) as
+					| S3Bucket.S3BucketId
+					| null;
+				const [bucket] = await S3Buckets.getBucketAccess(
+					Option.fromNullable(resumeBucketId),
+				).pipe(runPromise);
+
+				await bucket
+					.putObject(`${userId}/${videoId}/transcription.vtt`, transcription, {
+						contentType: "text/vtt",
+					})
+					.pipe(runPromise);
+
+				await db()
+					.update(videos)
+					.set({ transcriptionStatus: "COMPLETE", transcriptionJobId: null })
+					.where(eq(videos.id, videoId as Video.VideoId));
+
+				console.log(
+					`[transcribe-direct] Transcription completed for video ${videoId} (resumed)`,
+				);
+				return {
+					success: true,
+					message: "Transcription completed successfully (resumed)",
+				};
+			} catch (err) {
+				if (err instanceof Error && err.message === "ASSEMBLYAI_POLL_TIMEOUT") {
+					console.log(
+						`[transcribe-direct] Poll timed out for ${videoId}; will resume next call`,
+					);
+					return {
+						success: true,
+						message: "Transcription still in progress",
+					};
+				}
+				// Otherwise fall through to re-submit (clear the stale jobId first).
+				console.log(
+					`[transcribe-direct] Resume failed for ${videoId}, re-submitting: ${err instanceof Error ? err.message : err}`,
+				);
+				await db()
+					.update(videos)
+					.set({ transcriptionJobId: null })
+					.where(eq(videos.id, videoId as Video.VideoId));
+			}
 		}
 
 		const transcriptionDisabled =
@@ -284,8 +347,29 @@ export async function transcribeVideoDirect(
 			.getSignedObjectUrl(audioKey)
 			.pipe(runPromise);
 
-		// Transcribe with AssemblyAI (includes speaker diarization)
-		const transcription = await transcribeWithAssemblyAI(audioSignedUrl);
+		// Submit to AssemblyAI and persist the job ID immediately so we can
+		// resume polling on the next request if this one is killed mid-flight.
+		const submittedJobId = await submitAssemblyAIJob(audioSignedUrl);
+		await db()
+			.update(videos)
+			.set({ transcriptionJobId: submittedJobId })
+			.where(eq(videos.id, videoId as Video.VideoId));
+
+		let transcription: string;
+		try {
+			transcription = await pollAssemblyAIJob(submittedJobId);
+		} catch (err) {
+			if (err instanceof Error && err.message === "ASSEMBLYAI_POLL_TIMEOUT") {
+				console.log(
+					`[transcribe-direct] Poll timed out for ${videoId}; will resume next call`,
+				);
+				return {
+					success: true,
+					message: "Transcription still in progress",
+				};
+			}
+			throw err;
+		}
 
 		// Save transcription
 		await bucket
@@ -296,7 +380,7 @@ export async function transcribeVideoDirect(
 
 		await db()
 			.update(videos)
-			.set({ transcriptionStatus: "COMPLETE" })
+			.set({ transcriptionStatus: "COMPLETE", transcriptionJobId: null })
 			.where(eq(videos.id, videoId as Video.VideoId));
 
 		// Cleanup temp audio

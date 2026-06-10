@@ -337,6 +337,7 @@ export const videos = mysqlTable(
 		transcriptionStatus: varchar("transcriptionStatus", { length: 255 }).$type<
 			"PROCESSING" | "COMPLETE" | "ERROR" | "SKIPPED" | "NO_AUDIO"
 		>(),
+		transcriptionJobId: varchar("transcription_job_id", { length: 64 }),
 		source: json("source")
 			.$type<
 				| { type: "MediaConvert" }
