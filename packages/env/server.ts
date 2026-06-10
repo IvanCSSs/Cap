@@ -30,6 +30,9 @@ function createServerEnv() {
 			RESEND_API_KEY: z.string().optional(),
 			RESEND_FROM_DOMAIN: z.string().optional(),
 
+			// Custom transcription via AssemblyAI (see apps/web/lib/transcribe-direct.ts)
+			ASSEMBLYAI_API_KEY: z.string().optional(),
+
 			/// S3 configuration
 			// Though they are prefixed with `CAP_AWS`, these don't have to be
 			// for AWS, and can instead be for any S3-compatible service
